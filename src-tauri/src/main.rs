@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tauri::Manager;
 use uuid::Uuid;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -349,20 +350,49 @@ fn save_main_document(path: String, content: String) -> Result<ProjectManifest, 
 }
 
 fn main() {
+    // 崩溃日志：捕获 panic 并输出到 stderr
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("[mastps PANIC] {}", info);
+        if let Some(loc) = info.location() {
+            eprintln!("[mastps PANIC] at {}:{}", loc.file(), loc.line());
+        }
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("[mastps PANIC] backtrace:\n{}", bt);
+    }));
+
+    eprintln!("[mastps] main() starting...");
+
     tauri::Builder::default()
         .setup(|app| {
-            tauri::WebviewWindowBuilder::new(
+            eprintln!("[mastps] setup() called");
+            // 手动创建窗口，使用外部 URL 指向 Vite dev server
+            match tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
-                tauri::WebviewUrl::App("index.html".into()),
+                tauri::WebviewUrl::External("http://localhost:1420/".parse().unwrap()),
             )
             .title("MasterPieces")
             .inner_size(1280.0, 820.0)
             .center()
             .resizable(true)
             .visible(true)
-            .build()?;
-
+            .build()
+            {
+                Ok(win) => {
+                    eprintln!("[mastps] Window created OK: {:?}", win.label());
+                    let label = win.label().to_string();
+                    win.on_window_event(move |event| {
+                        if let tauri::WindowEvent::CloseRequested { .. } = event {
+                            eprintln!("[mastps] Window '{}' close requested!", label);
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("[mastps] Window build ERROR: {:?}", e);
+                    return Err(Box::new(e));
+                }
+            }
+            eprintln!("[mastps] setup() complete.");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
