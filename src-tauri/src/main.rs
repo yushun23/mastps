@@ -1,23 +1,13 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use tauri::Manager;
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 use uuid::Uuid;
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ProjectManifest {
-    id: String,
-    name: String,
-    created_at: String,
-    updated_at: String,
-}
-
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ProjectRecord {
     id: String,
@@ -25,7 +15,16 @@ struct ProjectRecord {
     path: String,
     created_at: String,
     updated_at: String,
-    exists: bool,
+    exists: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ProjectManifest {
+    id: String,
+    name: String,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -37,249 +36,394 @@ struct DocumentRecord {
     updated_at: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BinderNode {
+    id: String,
+    title: String,
+    icon: String,
+    created_at: String,
+    updated_at: String,
+    children: Vec<BinderNode>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BinderRoot {
+    id: String,
+    title: String,
+    icon: String,
+    children: Vec<BinderNode>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BinderState {
+    draft: BinderRoot,
+    outline: BinderRoot,
+}
+
+#[derive(Debug, Clone, Copy)]
 enum CollectionKind {
     Manuscript,
     Outline,
 }
 
 impl CollectionKind {
-    fn dir_name(self) -> &'static str {
-        match self {
-            CollectionKind::Manuscript => "documents",
-            CollectionKind::Outline => "outlines",
+    fn from_binder_collection(value: &str) -> Result<Self, String> {
+        match value {
+            "draft" => Ok(Self::Manuscript),
+            "outline" => Ok(Self::Outline),
+            _ => Err(format!("未知写作集合：{}", value)),
         }
     }
+}
 
-    fn index_name(self) -> &'static str {
-        match self {
-            CollectionKind::Manuscript => "documents.json",
-            CollectionKind::Outline => "outlines.json",
-        }
-    }
+fn now() -> String {
+    Utc::now().to_rfc3339()
+}
 
-    fn initial_title(self) -> &'static str {
-        match self {
-            CollectionKind::Manuscript => "正文",
-            CollectionKind::Outline => "自由写作",
-        }
-    }
+fn clean_component(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => ch,
+        })
+        .collect()
 }
 
 fn manifest_path(project_path: &str) -> PathBuf {
-    Path::new(project_path).join("project.json")
-}
-
-fn collection_dir(project_path: &str, kind: CollectionKind) -> PathBuf {
-    Path::new(project_path).join(kind.dir_name())
-}
-
-fn collection_index_path(project_path: &str, kind: CollectionKind) -> PathBuf {
-    collection_dir(project_path, kind).join(kind.index_name())
-}
-
-fn collection_file_path(project_path: &str, kind: CollectionKind, document_id: &str) -> PathBuf {
-    collection_dir(project_path, kind).join(format!("{}.html", document_id))
+    Path::new(project_path).join("manifest.json")
 }
 
 fn documents_dir(project_path: &str) -> PathBuf {
-    collection_dir(project_path, CollectionKind::Manuscript)
+    Path::new(project_path).join("documents")
 }
 
-fn document_file_path(project_path: &str, document_id: &str) -> PathBuf {
-    collection_file_path(project_path, CollectionKind::Manuscript, document_id)
+fn outlines_dir(project_path: &str) -> PathBuf {
+    Path::new(project_path).join("outlines")
 }
 
-fn legacy_document_path(project_path: &str) -> PathBuf {
-    documents_dir(project_path).join("main.txt")
+fn binder_documents_dir(project_path: &str) -> PathBuf {
+    Path::new(project_path).join("binder_documents")
 }
 
-fn read_manifest_from(project_path: &str) -> Result<ProjectManifest, String> {
-    let raw = fs::read_to_string(manifest_path(project_path)).map_err(|_| "项目文件未找到".to_string())?;
-    serde_json::from_str(&raw).map_err(|e| format!("项目文件损坏：{}", e))
+fn binder_path(project_path: &str) -> PathBuf {
+    Path::new(project_path).join("binder.json")
 }
 
-fn write_manifest(project_path: &str, manifest: &ProjectManifest) -> Result<(), String> {
+fn collection_dir(project_path: &str, kind: CollectionKind) -> PathBuf {
+    match kind {
+        CollectionKind::Manuscript => documents_dir(project_path),
+        CollectionKind::Outline => outlines_dir(project_path),
+    }
+}
+
+fn collection_index_path(project_path: &str, kind: CollectionKind) -> PathBuf {
+    collection_dir(project_path, kind).join("index.json")
+}
+
+fn collection_document_path(project_path: &str, kind: CollectionKind, document_id: &str) -> PathBuf {
+    collection_dir(project_path, kind).join(format!("{}.html", document_id))
+}
+
+fn binder_document_path(project_path: &str, document_id: &str) -> PathBuf {
+    binder_documents_dir(project_path).join(format!("{}.html", document_id))
+}
+
+fn read_manifest_from(path: &str) -> Result<ProjectManifest, String> {
+    let file = manifest_path(path);
+    let raw = fs::read_to_string(&file).map_err(|e| format!("无法读取项目清单 {}：{}", file.display(), e))?;
+    serde_json::from_str(&raw).map_err(|e| format!("项目清单格式错误：{}", e))
+}
+
+fn write_manifest(path: &str, manifest: &ProjectManifest) -> Result<(), String> {
+    let file = manifest_path(path);
+    fs::create_dir_all(Path::new(path)).map_err(|e| e.to_string())?;
     let raw = serde_json::to_string_pretty(manifest).map_err(|e| e.to_string())?;
-    fs::write(manifest_path(project_path), raw).map_err(|e| e.to_string())
+    fs::write(&file, raw).map_err(|e| format!("无法写入项目清单 {}：{}", file.display(), e))
 }
 
-fn touch_project(project_path: &str) -> Result<ProjectManifest, String> {
-    let mut manifest = read_manifest_from(project_path)?;
-    manifest.updated_at = Utc::now().to_rfc3339();
-    write_manifest(project_path, &manifest)?;
+fn touch_manifest(path: &str) -> Result<ProjectManifest, String> {
+    let mut manifest = read_manifest_from(path)?;
+    manifest.updated_at = now();
+    write_manifest(path, &manifest)?;
     Ok(manifest)
 }
 
-fn to_project_record(project_path: String, manifest: ProjectManifest) -> ProjectRecord {
+fn manifest_to_record(path: &str, manifest: ProjectManifest) -> ProjectRecord {
     ProjectRecord {
         id: manifest.id,
         name: manifest.name,
-        path: project_path,
+        path: path.to_string(),
         created_at: manifest.created_at,
         updated_at: manifest.updated_at,
-        exists: true,
+        exists: Some(true),
     }
 }
 
-fn safe_document_id(document_id: &str) -> Result<String, String> {
-    let clean = document_id.trim();
-    if clean.is_empty() {
-        return Err("文档编号不能为空".to_string());
-    }
-    if clean.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        Ok(clean.to_string())
-    } else {
-        Err("文档编号非法".to_string())
-    }
+fn ensure_project_dirs(project_path: &str) -> Result<(), String> {
+    fs::create_dir_all(documents_dir(project_path)).map_err(|e| e.to_string())?;
+    fs::create_dir_all(outlines_dir(project_path)).map_err(|e| e.to_string())?;
+    fs::create_dir_all(binder_documents_dir(project_path)).map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 fn read_collection_index(project_path: &str, kind: CollectionKind) -> Result<Vec<DocumentRecord>, String> {
-    fs::create_dir_all(collection_dir(project_path, kind)).map_err(|e| e.to_string())?;
-    let index_path = collection_index_path(project_path, kind);
-    if index_path.exists() {
-        let raw = fs::read_to_string(index_path).map_err(|e| e.to_string())?;
-        let docs: Vec<DocumentRecord> = serde_json::from_str(&raw)
-            .map_err(|e| format!("{}目录损坏：{}", kind.initial_title(), e))?;
-        return Ok(docs);
+    let file = collection_index_path(project_path, kind);
+    if !file.exists() {
+        return Ok(Vec::new());
     }
-
-    let now = Utc::now().to_rfc3339();
-    let initial = DocumentRecord {
-        id: "main".to_string(),
-        title: kind.initial_title().to_string(),
-        created_at: now.clone(),
-        updated_at: now.clone(),
-    };
-
-    let main_file = collection_file_path(project_path, kind, "main");
-    if !main_file.exists() {
-        let initial_content = match kind {
-            CollectionKind::Manuscript => fs::read_to_string(legacy_document_path(project_path)).unwrap_or_default(),
-            CollectionKind::Outline => String::new(),
-        };
-        fs::write(&main_file, initial_content).map_err(|e| e.to_string())?;
-    }
-
-    write_collection_index(project_path, kind, &[initial.clone()])?;
-    Ok(vec![initial])
+    let raw = fs::read_to_string(&file).map_err(|e| format!("无法读取文档索引 {}：{}", file.display(), e))?;
+    serde_json::from_str(&raw).map_err(|e| format!("文档索引格式错误：{}", e))
 }
 
-fn write_collection_index(project_path: &str, kind: CollectionKind, docs: &[DocumentRecord]) -> Result<(), String> {
-    fs::create_dir_all(collection_dir(project_path, kind)).map_err(|e| e.to_string())?;
-    let raw = serde_json::to_string_pretty(docs).map_err(|e| e.to_string())?;
-    fs::write(collection_index_path(project_path, kind), raw).map_err(|e| e.to_string())
+fn write_collection_index(project_path: &str, kind: CollectionKind, documents: &[DocumentRecord]) -> Result<(), String> {
+    let dir = collection_dir(project_path, kind);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let file = collection_index_path(project_path, kind);
+    let raw = serde_json::to_string_pretty(documents).map_err(|e| e.to_string())?;
+    fs::write(&file, raw).map_err(|e| format!("无法写入文档索引 {}：{}", file.display(), e))
 }
 
 fn create_collection_document(project_path: &str, kind: CollectionKind, title: String) -> Result<Vec<DocumentRecord>, String> {
     let clean_title = title.trim();
     if clean_title.is_empty() {
-        return Err("文档名称不能为空".to_string());
+        return Err("文档标题不能为空".to_string());
     }
-
-    let mut docs = read_collection_index(project_path, kind)?;
-    let now = Utc::now().to_rfc3339();
-    let doc = DocumentRecord {
-        id: Uuid::new_v4().to_string(),
+    ensure_project_dirs(project_path)?;
+    let mut documents = read_collection_index(project_path, kind)?;
+    let timestamp = now();
+    let id = Uuid::new_v4().to_string();
+    let record = DocumentRecord {
+        id: id.clone(),
         title: clean_title.to_string(),
-        created_at: now.clone(),
-        updated_at: now.clone(),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
     };
-    fs::write(collection_file_path(project_path, kind, &doc.id), "").map_err(|e| e.to_string())?;
-    docs.push(doc);
-    write_collection_index(project_path, kind, &docs)?;
-    let _ = touch_project(project_path)?;
-    Ok(docs)
+    let file = collection_document_path(project_path, kind, &id);
+    fs::write(&file, "").map_err(|e| format!("无法创建文档 {}：{}", file.display(), e))?;
+    documents.push(record);
+    write_collection_index(project_path, kind, &documents)?;
+    let _ = touch_manifest(project_path);
+    Ok(documents)
 }
 
-fn rename_collection_document(
-    project_path: &str,
-    kind: CollectionKind,
-    document_id: String,
-    title: String,
-) -> Result<Vec<DocumentRecord>, String> {
-    let doc_id = safe_document_id(&document_id)?;
+fn rename_collection_document(project_path: &str, kind: CollectionKind, document_id: String, title: String) -> Result<Vec<DocumentRecord>, String> {
     let clean_title = title.trim();
     if clean_title.is_empty() {
-        return Err("文档名称不能为空".to_string());
+        return Err("文档标题不能为空".to_string());
     }
-
-    let mut docs = read_collection_index(project_path, kind)?;
-    let now = Utc::now().to_rfc3339();
+    let mut documents = read_collection_index(project_path, kind)?;
     let mut found = false;
-    for doc in &mut docs {
-        if doc.id == doc_id {
+    for doc in &mut documents {
+        if doc.id == document_id {
             doc.title = clean_title.to_string();
-            doc.updated_at = now.clone();
+            doc.updated_at = now();
             found = true;
+            break;
         }
     }
     if !found {
-        return Err("文档未找到".to_string());
+        return Err("未找到该文档".to_string());
     }
-    write_collection_index(project_path, kind, &docs)?;
-    let _ = touch_project(project_path)?;
-    Ok(docs)
+    write_collection_index(project_path, kind, &documents)?;
+    let _ = touch_manifest(project_path);
+    Ok(documents)
 }
 
 fn delete_collection_document(project_path: &str, kind: CollectionKind, document_id: String) -> Result<Vec<DocumentRecord>, String> {
-    let doc_id = safe_document_id(&document_id)?;
-    if doc_id == "main" {
-        return Err("默认文档不能删除".to_string());
+    let mut documents = read_collection_index(project_path, kind)?;
+    documents.retain(|doc| doc.id != document_id);
+    let file = collection_document_path(project_path, kind, &document_id);
+    if file.exists() {
+        let _ = fs::remove_file(file);
     }
-
-    let mut docs = read_collection_index(project_path, kind)?;
-    let before = docs.len();
-    docs.retain(|doc| doc.id != doc_id);
-    if docs.len() == before {
-        return Err("文档未找到".to_string());
-    }
-
-    let file_path = collection_file_path(project_path, kind, &doc_id);
-    if file_path.exists() {
-        fs::remove_file(file_path).map_err(|e| e.to_string())?;
-    }
-    write_collection_index(project_path, kind, &docs)?;
-    let _ = touch_project(project_path)?;
-    Ok(docs)
+    write_collection_index(project_path, kind, &documents)?;
+    let _ = touch_manifest(project_path);
+    Ok(documents)
 }
 
 fn read_collection_document(project_path: &str, kind: CollectionKind, document_id: String) -> Result<String, String> {
-    let doc_id = safe_document_id(&document_id)?;
-    let doc_path = collection_file_path(project_path, kind, &doc_id);
-    if !doc_path.exists() {
+    let file = collection_document_path(project_path, kind, &document_id);
+    if !file.exists() {
         return Ok(String::new());
     }
-    fs::read_to_string(doc_path).map_err(|e| e.to_string())
+    fs::read_to_string(&file).map_err(|e| format!("无法读取文档 {}：{}", file.display(), e))
 }
 
-fn save_collection_document(
-    project_path: &str,
-    kind: CollectionKind,
-    document_id: String,
-    content: String,
-) -> Result<ProjectManifest, String> {
-    let doc_id = safe_document_id(&document_id)?;
-    fs::create_dir_all(collection_dir(project_path, kind)).map_err(|e| e.to_string())?;
-    fs::write(collection_file_path(project_path, kind, &doc_id), content).map_err(|e| e.to_string())?;
-
-    let mut docs = read_collection_index(project_path, kind)?;
-    let now = Utc::now().to_rfc3339();
-    for doc in &mut docs {
-        if doc.id == doc_id {
-            doc.updated_at = now.clone();
+fn save_collection_document(project_path: &str, kind: CollectionKind, document_id: String, content: String) -> Result<ProjectManifest, String> {
+    ensure_project_dirs(project_path)?;
+    let file = collection_document_path(project_path, kind, &document_id);
+    fs::write(&file, content).map_err(|e| format!("无法保存文档 {}：{}", file.display(), e))?;
+    let mut documents = read_collection_index(project_path, kind)?;
+    for doc in &mut documents {
+        if doc.id == document_id {
+            doc.updated_at = now();
         }
     }
-    write_collection_index(project_path, kind, &docs)?;
-    touch_project(project_path)
+    write_collection_index(project_path, kind, &documents)?;
+    touch_manifest(project_path)
 }
 
-fn read_documents_index(project_path: &str) -> Result<Vec<DocumentRecord>, String> {
-    read_collection_index(project_path, CollectionKind::Manuscript)
+fn default_node(project_path: &str, title: &str, icon: &str) -> Result<BinderNode, String> {
+    let timestamp = now();
+    let id = Uuid::new_v4().to_string();
+    let file = binder_document_path(project_path, &id);
+    fs::write(&file, "").map_err(|e| format!("无法创建文稿 {}：{}", file.display(), e))?;
+    Ok(BinderNode {
+        id,
+        title: title.to_string(),
+        icon: icon.to_string(),
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+        children: Vec::new(),
+    })
 }
 
-fn write_documents_index(project_path: &str, docs: &[DocumentRecord]) -> Result<(), String> {
-    write_collection_index(project_path, CollectionKind::Manuscript, docs)
+fn legacy_nodes(project_path: &str, kind: CollectionKind) -> Vec<BinderNode> {
+    let docs = read_collection_index(project_path, kind).unwrap_or_default();
+    docs.into_iter()
+        .map(|doc| {
+            let legacy = collection_document_path(project_path, kind, &doc.id);
+            let target = binder_document_path(project_path, &doc.id);
+            if legacy.exists() && !target.exists() {
+                let _ = fs::copy(&legacy, &target);
+            }
+            BinderNode {
+                id: doc.id,
+                title: doc.title,
+                icon: match kind {
+                    CollectionKind::Manuscript => "▦".to_string(),
+                    CollectionKind::Outline => "◇".to_string(),
+                },
+                created_at: doc.created_at,
+                updated_at: doc.updated_at,
+                children: Vec::new(),
+            }
+        })
+        .collect()
+}
+
+fn build_default_binder_state(project_path: &str) -> Result<BinderState, String> {
+    ensure_project_dirs(project_path)?;
+    let mut draft_children = legacy_nodes(project_path, CollectionKind::Manuscript);
+    let mut outline_children = legacy_nodes(project_path, CollectionKind::Outline);
+
+    if draft_children.is_empty() {
+        draft_children.push(default_node(project_path, "正文", "▦")?);
+    }
+    if outline_children.is_empty() {
+        outline_children.push(default_node(project_path, "自由写作", "◇")?);
+    }
+
+    Ok(BinderState {
+        draft: BinderRoot {
+            id: "draft-root".to_string(),
+            title: "草稿".to_string(),
+            icon: "📚".to_string(),
+            children: draft_children,
+        },
+        outline: BinderRoot {
+            id: "outline-root".to_string(),
+            title: "大纲".to_string(),
+            icon: "🧭".to_string(),
+            children: outline_children,
+        },
+    })
+}
+
+fn read_binder_state(project_path: &str) -> Result<BinderState, String> {
+    ensure_project_dirs(project_path)?;
+    let file = binder_path(project_path);
+    if !file.exists() {
+        let state = build_default_binder_state(project_path)?;
+        write_binder_state(project_path, &state)?;
+        return Ok(state);
+    }
+    let raw = fs::read_to_string(&file).map_err(|e| format!("无法读取 Binder {}：{}", file.display(), e))?;
+    serde_json::from_str(&raw).map_err(|e| format!("Binder 格式错误：{}", e))
+}
+
+fn write_binder_state(project_path: &str, state: &BinderState) -> Result<(), String> {
+    ensure_project_dirs(project_path)?;
+    let file = binder_path(project_path);
+    let raw = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
+    fs::write(&file, raw).map_err(|e| format!("无法写入 Binder {}：{}", file.display(), e))
+}
+
+fn root_mut<'a>(state: &'a mut BinderState, collection: &str) -> Result<&'a mut BinderRoot, String> {
+    match collection {
+        "draft" => Ok(&mut state.draft),
+        "outline" => Ok(&mut state.outline),
+        _ => Err(format!("未知写作集合：{}", collection)),
+    }
+}
+
+fn add_child_to(nodes: &mut Vec<BinderNode>, parent_id: &str, child: BinderNode) -> bool {
+    for node in nodes.iter_mut() {
+        if node.id == parent_id {
+            node.children.push(child);
+            node.updated_at = now();
+            return true;
+        }
+        if add_child_to(&mut node.children, parent_id, child.clone()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn rename_node(nodes: &mut [BinderNode], document_id: &str, title: &str, icon: &str) -> bool {
+    for node in nodes.iter_mut() {
+        if node.id == document_id {
+            node.title = title.to_string();
+            node.icon = icon.to_string();
+            node.updated_at = now();
+            return true;
+        }
+        if rename_node(&mut node.children, document_id, title, icon) {
+            return true;
+        }
+    }
+    false
+}
+
+fn touch_node(nodes: &mut [BinderNode], document_id: &str) -> bool {
+    for node in nodes.iter_mut() {
+        if node.id == document_id {
+            node.updated_at = now();
+            return true;
+        }
+        if touch_node(&mut node.children, document_id) {
+            return true;
+        }
+    }
+    false
+}
+
+fn collect_node_ids(node: &BinderNode, ids: &mut Vec<String>) {
+    ids.push(node.id.clone());
+    for child in &node.children {
+        collect_node_ids(child, ids);
+    }
+}
+
+fn remove_node(nodes: &mut Vec<BinderNode>, document_id: &str, removed_ids: &mut Vec<String>) -> bool {
+    if let Some(position) = nodes.iter().position(|node| node.id == document_id) {
+        let node = nodes.remove(position);
+        collect_node_ids(&node, removed_ids);
+        return true;
+    }
+    for node in nodes.iter_mut() {
+        if remove_node(&mut node.children, document_id, removed_ids) {
+            node.updated_at = now();
+            return true;
+        }
+    }
+    false
 }
 
 #[tauri::command]
@@ -293,7 +437,6 @@ fn choose_folder(prompt: Option<String>) -> Result<Option<String>, String> {
             .arg(script)
             .output()
             .map_err(|e| format!("无法打开文件夹选择器：{}", e))?;
-
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if path.is_empty() {
@@ -328,65 +471,34 @@ fn create_project(name: String, parent_path: String) -> Result<ProjectRecord, St
     if parent.as_os_str().is_empty() {
         return Err("存档位置不能为空".to_string());
     }
+    fs::create_dir_all(parent).map_err(|e| format!("无法创建存档文件夹：{}", e))?;
 
     let id = Uuid::new_v4().to_string();
-    let safe_name: String = clean_name
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => ch,
-        })
-        .collect();
+    let safe_name = clean_component(clean_name);
     let project_path = parent.join(format!("{} - {}.masterpiece", safe_name, &id[..8]));
     let project_path_string = project_path.to_string_lossy().to_string();
+    fs::create_dir_all(&project_path).map_err(|e| format!("无法创建项目目录：{}", e))?;
+    ensure_project_dirs(&project_path_string)?;
 
-    fs::create_dir_all(documents_dir(&project_path_string)).map_err(|e| e.to_string())?;
-    fs::create_dir_all(collection_dir(&project_path_string, CollectionKind::Outline)).map_err(|e| e.to_string())?;
-
-    let now = Utc::now().to_rfc3339();
+    let timestamp = now();
     let manifest = ProjectManifest {
-        id: id.clone(),
-        name: clean_name.to_string(),
-        created_at: now.clone(),
-        updated_at: now.clone(),
-    };
-    write_manifest(&project_path_string, &manifest)?;
-
-    let initial_doc = DocumentRecord {
-        id: "main".to_string(),
-        title: "正文".to_string(),
-        created_at: now.clone(),
-        updated_at: now.clone(),
-    };
-    write_documents_index(&project_path_string, &[initial_doc])?;
-    fs::write(document_file_path(&project_path_string, "main"), "").map_err(|e| e.to_string())?;
-
-    let initial_outline = DocumentRecord {
-        id: "main".to_string(),
-        title: "自由写作".to_string(),
-        created_at: now.clone(),
-        updated_at: now.clone(),
-    };
-    write_collection_index(&project_path_string, CollectionKind::Outline, &[initial_outline])?;
-    fs::write(collection_file_path(&project_path_string, CollectionKind::Outline, "main"), "").map_err(|e| e.to_string())?;
-
-    Ok(ProjectRecord {
         id,
         name: clean_name.to_string(),
-        path: project_path_string,
-        created_at: now.clone(),
-        updated_at: now,
-        exists: true,
-    })
+        created_at: timestamp.clone(),
+        updated_at: timestamp,
+    };
+    write_manifest(&project_path_string, &manifest)?;
+    let state = build_default_binder_state(&project_path_string)?;
+    write_binder_state(&project_path_string, &state)?;
+    Ok(manifest_to_record(&project_path_string, manifest))
 }
 
 #[tauri::command]
 fn import_project(path: String) -> Result<ProjectRecord, String> {
-    let clean_path = path.trim().to_string();
+    let clean_path = path.trim().trim_end_matches('/').to_string();
     let manifest = read_manifest_from(&clean_path)?;
-    let _ = read_documents_index(&clean_path)?;
-    let _ = read_collection_index(&clean_path, CollectionKind::Outline)?;
-    Ok(to_project_record(clean_path, manifest))
+    ensure_project_dirs(&clean_path)?;
+    Ok(manifest_to_record(&clean_path, manifest))
 }
 
 #[tauri::command]
@@ -402,14 +514,14 @@ fn rename_project(path: String, name: String) -> Result<ProjectManifest, String>
     }
     let mut manifest = read_manifest_from(&path)?;
     manifest.name = clean_name.to_string();
-    manifest.updated_at = Utc::now().to_rfc3339();
+    manifest.updated_at = now();
     write_manifest(&path, &manifest)?;
     Ok(manifest)
 }
 
 #[tauri::command]
 fn list_documents(path: String) -> Result<Vec<DocumentRecord>, String> {
-    read_documents_index(&path)
+    read_collection_index(&path, CollectionKind::Manuscript)
 }
 
 #[tauri::command]
@@ -469,56 +581,161 @@ fn save_outline_document(path: String, document_id: String, content: String) -> 
 
 #[tauri::command]
 fn read_main_document(path: String) -> Result<String, String> {
-    read_document(path, "main".to_string())
+    let file = documents_dir(&path).join("main.html");
+    if !file.exists() {
+        return Ok(String::new());
+    }
+    fs::read_to_string(&file).map_err(|e| format!("无法读取正文：{}", e))
 }
 
 #[tauri::command]
 fn save_main_document(path: String, content: String) -> Result<ProjectManifest, String> {
-    save_document(path, "main".to_string(), content)
+    ensure_project_dirs(&path)?;
+    let file = documents_dir(&path).join("main.html");
+    fs::write(&file, content).map_err(|e| format!("无法保存正文：{}", e))?;
+    touch_manifest(&path)
+}
+
+#[tauri::command]
+fn read_binder(path: String) -> Result<BinderState, String> {
+    read_binder_state(&path)
+}
+
+#[tauri::command]
+fn update_binder_root(path: String, collection: String, title: String, icon: String) -> Result<BinderState, String> {
+    let clean_title = title.trim();
+    if clean_title.is_empty() {
+        return Err("根目录名称不能为空".to_string());
+    }
+    let mut state = read_binder_state(&path)?;
+    let root = root_mut(&mut state, &collection)?;
+    root.title = clean_title.to_string();
+    root.icon = if icon.trim().is_empty() { "📚".to_string() } else { icon.trim().to_string() };
+    write_binder_state(&path, &state)?;
+    let _ = touch_manifest(&path);
+    Ok(state)
+}
+
+#[tauri::command]
+fn create_binder_document(
+    path: String,
+    collection: String,
+    parent_id: Option<String>,
+    title: String,
+    icon: String,
+) -> Result<BinderState, String> {
+    let clean_title = title.trim();
+    if clean_title.is_empty() {
+        return Err("文稿标题不能为空".to_string());
+    }
+    let _ = CollectionKind::from_binder_collection(&collection)?;
+    let mut state = read_binder_state(&path)?;
+    let child = default_node(
+        &path,
+        clean_title,
+        if icon.trim().is_empty() { "▦" } else { icon.trim() },
+    )?;
+    let root = root_mut(&mut state, &collection)?;
+    match parent_id.as_deref() {
+        None => root.children.push(child),
+        Some(id) if id == root.id => root.children.push(child),
+        Some(id) => {
+            if !add_child_to(&mut root.children, id, child) {
+                return Err("未找到父文稿".to_string());
+            }
+        }
+    }
+    write_binder_state(&path, &state)?;
+    let _ = touch_manifest(&path);
+    Ok(state)
+}
+
+#[tauri::command]
+fn rename_binder_document(
+    path: String,
+    collection: String,
+    document_id: String,
+    title: String,
+    icon: String,
+) -> Result<BinderState, String> {
+    let clean_title = title.trim();
+    if clean_title.is_empty() {
+        return Err("文稿标题不能为空".to_string());
+    }
+    let mut state = read_binder_state(&path)?;
+    let root = root_mut(&mut state, &collection)?;
+    if !rename_node(
+        &mut root.children,
+        &document_id,
+        clean_title,
+        if icon.trim().is_empty() { "▦" } else { icon.trim() },
+    ) {
+        return Err("未找到该文稿".to_string());
+    }
+    write_binder_state(&path, &state)?;
+    let _ = touch_manifest(&path);
+    Ok(state)
+}
+
+#[tauri::command]
+fn delete_binder_document(path: String, collection: String, document_id: String) -> Result<BinderState, String> {
+    let mut state = read_binder_state(&path)?;
+    let root = root_mut(&mut state, &collection)?;
+    let mut removed_ids = Vec::new();
+    if !remove_node(&mut root.children, &document_id, &mut removed_ids) {
+        return Err("未找到该文稿".to_string());
+    }
+    for id in removed_ids {
+        let file = binder_document_path(&path, &id);
+        if file.exists() {
+            let _ = fs::remove_file(file);
+        }
+    }
+    write_binder_state(&path, &state)?;
+    let _ = touch_manifest(&path);
+    Ok(state)
+}
+
+#[tauri::command]
+fn read_binder_document(path: String, document_id: String) -> Result<String, String> {
+    ensure_project_dirs(&path)?;
+    let file = binder_document_path(&path, &document_id);
+    if !file.exists() {
+        return Ok(String::new());
+    }
+    fs::read_to_string(&file).map_err(|e| format!("无法读取文稿 {}：{}", file.display(), e))
+}
+
+#[tauri::command]
+fn save_binder_document(path: String, document_id: String, content: String) -> Result<ProjectManifest, String> {
+    ensure_project_dirs(&path)?;
+    let file = binder_document_path(&path, &document_id);
+    fs::write(&file, content).map_err(|e| format!("无法保存文稿 {}：{}", file.display(), e))?;
+    if let Ok(mut state) = read_binder_state(&path) {
+        let mut changed = touch_node(&mut state.draft.children, &document_id);
+        changed = touch_node(&mut state.outline.children, &document_id) || changed;
+        if changed {
+            let _ = write_binder_state(&path, &state);
+        }
+    }
+    touch_manifest(&path)
 }
 
 fn main() {
-    std::panic::set_hook(Box::new(|info| {
-        eprintln!("[mastps PANIC] {}", info);
-        if let Some(loc) = info.location() {
-            eprintln!("[mastps PANIC] at {}:{}", loc.file(), loc.line());
-        }
-        let bt = std::backtrace::Backtrace::force_capture();
-        eprintln!("[mastps PANIC] backtrace:\n{}", bt);
-    }));
-
-    eprintln!("[mastps] main() starting...");
-
     tauri::Builder::default()
         .setup(|app| {
-            eprintln!("[mastps] setup() called");
-            match tauri::WebviewWindowBuilder::new(
-                app,
-                "main",
-                tauri::WebviewUrl::External("http://localhost:1420/".parse().unwrap()),
-            )
-            .title("MasterPieces")
-            .inner_size(1280.0, 820.0)
-            .center()
-            .resizable(true)
-            .visible(true)
-            .build()
-            {
-                Ok(win) => {
-                    eprintln!("[mastps] Window created OK: {:?}", win.label());
-                    let label = win.label().to_string();
-                    win.on_window_event(move |event| {
-                        if let tauri::WindowEvent::CloseRequested { .. } = event {
-                            eprintln!("[mastps] Window '{}' close requested!", label);
-                        }
-                    });
-                }
-                Err(e) => {
-                    eprintln!("[mastps] Window build ERROR: {:?}", e);
-                    return Err(Box::new(e));
-                }
-            }
-            eprintln!("[mastps] setup() complete.");
+            let url = if cfg!(debug_assertions) {
+                tauri::WebviewUrl::External("http://localhost:1420/".parse().unwrap())
+            } else {
+                tauri::WebviewUrl::App("index.html".into())
+            };
+            tauri::WebviewWindowBuilder::new(app, "main", url)
+                .title("MasterPieces")
+                .inner_size(1360.0, 860.0)
+                .center()
+                .resizable(true)
+                .visible(true)
+                .build()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -540,7 +757,14 @@ fn main() {
             read_outline_document,
             save_outline_document,
             read_main_document,
-            save_main_document
+            save_main_document,
+            read_binder,
+            update_binder_root,
+            create_binder_document,
+            rename_binder_document,
+            delete_binder_document,
+            read_binder_document,
+            save_binder_document
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

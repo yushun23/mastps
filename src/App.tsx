@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { BubbleMenu, EditorContent, useEditor } from "@tiptap/react";
 import { Extension } from "@tiptap/core";
@@ -19,6 +19,8 @@ import TableRow from "@tiptap/extension-table-row";
 import TableHeader from "@tiptap/extension-table-header";
 import TableCell from "@tiptap/extension-table-cell";
 
+import "./index.css";
+
 type ProjectRecord = {
   id: string;
   name: string;
@@ -35,35 +37,50 @@ type ProjectManifest = {
   updatedAt: string;
 };
 
-type DocumentRecord = {
+type BinderNode = {
   id: string;
   title: string;
+  icon: string;
   createdAt: string;
   updatedAt: string;
+  children: BinderNode[];
 };
 
-type View = "splash" | "projects" | "hub" | "outline" | "writer" | "outlineWriter";
+type BinderRoot = {
+  id: string;
+  title: string;
+  icon: string;
+  children: BinderNode[];
+};
 
-type WorkspaceMode = "manuscript" | "outline";
+type BinderState = {
+  draft: BinderRoot;
+  outline: BinderRoot;
+};
 
+type BinderCollection = "draft" | "outline";
+type View = "splash" | "projects" | "writer";
 type ModalMode =
-  | "create"
-  | "import"
-  | "rename"
-  | "relocate"
-  | "actions"
-  | "createDocument"
-  | "renameDocument"
+  | "createProject"
+  | "importProject"
+  | "renameProject"
+  | "relocateProject"
+  | "projectActions"
+  | "createNode"
+  | "editNode"
   | "insertLink"
   | "insertImage"
   | "preferences"
   | null;
 
-type ToolbarGroup = "history" | "format" | "inline" | "align" | "list" | "insert" | "table";
+type NodeTarget = {
+  collection: BinderCollection;
+  parentId?: string;
+  nodeId?: string;
+  isRoot?: boolean;
+};
 
 type ToolbarItemId =
-  | "undo"
-  | "redo"
   | "paragraph"
   | "h1"
   | "h2"
@@ -74,82 +91,56 @@ type ToolbarItemId =
   | "underline"
   | "strike"
   | "code"
-  | "alignLeft"
-  | "alignCenter"
-  | "alignRight"
-  | "alignJustify"
-  | "bulletList"
-  | "orderedList"
-  | "taskList"
-  | "blockquote"
+  | "quote"
   | "codeBlock"
-  | "horizontalRule"
+  | "left"
+  | "center"
+  | "right"
+  | "justify"
+  | "bullet"
+  | "ordered"
+  | "task"
+  | "rule"
   | "link"
   | "image"
   | "table"
-  | "addRow"
-  | "addColumn"
-  | "mergeCells"
-  | "splitCell"
-  | "deleteTable";
+  | "row"
+  | "column"
+  | "merge"
+  | "split"
+  | "deleteTable"
+  | "fontSize"
+  | "lineHeight"
+  | "color"
+  | "highlight"
+  | "undo"
+  | "redo";
 
-type ToolbarDefinition = {
+type ToolbarGroup = "format" | "layout" | "insert" | "table" | "history" | "style";
+
+type ToolbarItem = {
   id: ToolbarItemId;
   title: string;
   icon: string;
   group: ToolbarGroup;
+  run?: () => void;
+  active?: () => boolean;
+  disabled?: () => boolean;
+  control?: "fontSize" | "lineHeight" | "color" | "highlight";
 };
 
 const RECENT_PROJECTS_KEY = "masterpieces.recentProjects.v1";
-const TOOLBAR_PREFS_KEY = "masterpieces.visibleToolbarButtons.v2";
+const TOOLBAR_PREFS_KEY = "masterpieces.toolbar.visible.v3";
+
+const EMPTY_BINDER: BinderState = {
+  draft: { id: "draft-root", title: "草稿", icon: "📚", children: [] },
+  outline: { id: "outline-root", title: "大纲", icon: "🧭", children: [] },
+};
 
 const FONT_SIZE_OPTIONS = ["14px", "16px", "18px", "20px", "24px", "28px", "32px"];
 const LINE_HEIGHT_OPTIONS = ["1.4", "1.6", "1.8", "2", "2.2", "2.5"];
 const COLOR_PRESETS = ["#f5f5f5", "#111111", "#7c2d12", "#92400e", "#166534", "#1d4ed8", "#6d28d9", "#be123c"];
 const HIGHLIGHT_PRESETS = ["#fef08a", "#fed7aa", "#bbf7d0", "#bfdbfe", "#e9d5ff"];
-
-const TOOLBAR_GROUP_LABELS: Record<ToolbarGroup, string> = {
-  history: "历史",
-  format: "段落层级",
-  inline: "文字样式",
-  align: "对齐",
-  list: "列表与块",
-  insert: "插入",
-  table: "表格",
-};
-
-const TOOLBAR_CATALOG: ToolbarDefinition[] = [
-  { id: "undo", title: "撤销", icon: "↶", group: "history" },
-  { id: "redo", title: "重做", icon: "↷", group: "history" },
-  { id: "paragraph", title: "正文", icon: "¶", group: "format" },
-  { id: "h1", title: "一级标题", icon: "H1", group: "format" },
-  { id: "h2", title: "二级标题", icon: "H2", group: "format" },
-  { id: "h3", title: "三级标题", icon: "H3", group: "format" },
-  { id: "h4", title: "四级标题", icon: "H4", group: "format" },
-  { id: "bold", title: "加粗", icon: "B", group: "inline" },
-  { id: "italic", title: "斜体", icon: "I", group: "inline" },
-  { id: "underline", title: "下划线", icon: "U", group: "inline" },
-  { id: "strike", title: "删除线", icon: "S", group: "inline" },
-  { id: "code", title: "行内代码", icon: "</>", group: "inline" },
-  { id: "alignLeft", title: "左对齐", icon: "≡", group: "align" },
-  { id: "alignCenter", title: "居中", icon: "≣", group: "align" },
-  { id: "alignRight", title: "右对齐", icon: "≡", group: "align" },
-  { id: "alignJustify", title: "两端对齐", icon: "▤", group: "align" },
-  { id: "bulletList", title: "无序列表", icon: "•", group: "list" },
-  { id: "orderedList", title: "有序列表", icon: "1.", group: "list" },
-  { id: "taskList", title: "任务清单", icon: "☑", group: "list" },
-  { id: "blockquote", title: "引用", icon: "“”", group: "list" },
-  { id: "codeBlock", title: "代码块", icon: "▣", group: "list" },
-  { id: "horizontalRule", title: "分割线", icon: "—", group: "insert" },
-  { id: "link", title: "链接", icon: "🔗", group: "insert" },
-  { id: "image", title: "图片", icon: "▧", group: "insert" },
-  { id: "table", title: "表格", icon: "▦", group: "insert" },
-  { id: "addRow", title: "增加行", icon: "↕", group: "table" },
-  { id: "addColumn", title: "增加列", icon: "↔", group: "table" },
-  { id: "mergeCells", title: "合并单元格", icon: "⇄", group: "table" },
-  { id: "splitCell", title: "拆分单元格", icon: "⇆", group: "table" },
-  { id: "deleteTable", title: "删除表格", icon: "×", group: "table" },
-];
 
 const DEFAULT_VISIBLE_TOOLBAR_IDS: ToolbarItemId[] = [
   "paragraph",
@@ -160,18 +151,30 @@ const DEFAULT_VISIBLE_TOOLBAR_IDS: ToolbarItemId[] = [
   "italic",
   "underline",
   "strike",
-  "blockquote",
+  "quote",
   "code",
-  "alignLeft",
-  "alignCenter",
-  "alignRight",
-  "bulletList",
-  "orderedList",
-  "link",
-  "table",
+  "left",
+  "center",
+  "right",
+  "bullet",
+  "ordered",
   "undo",
   "redo",
+  "link",
+  "fontSize",
+  "lineHeight",
+  "color",
+  "highlight",
 ];
+
+const TOOLBAR_GROUP_LABELS: Record<ToolbarGroup, string> = {
+  format: "文本格式",
+  layout: "段落与列表",
+  insert: "插入",
+  table: "表格",
+  history: "历史",
+  style: "样式",
+};
 
 const FontSize = Extension.create({
   name: "fontSize",
@@ -226,8 +229,8 @@ function loadRecentProjects(): ProjectRecord[] {
   try {
     const raw = localStorage.getItem(RECENT_PROJECTS_KEY);
     if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as ProjectRecord[]) : [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
   }
@@ -237,63 +240,80 @@ function saveRecentProjects(projects: ProjectRecord[]) {
   localStorage.setItem(RECENT_PROJECTS_KEY, JSON.stringify(projects));
 }
 
-function isToolbarItemId(value: string): value is ToolbarItemId {
-  return TOOLBAR_CATALOG.some((item) => item.id === value);
-}
-
-function loadToolbarPreferences(): ToolbarItemId[] {
+function loadToolbarVisibleIds(): ToolbarItemId[] {
   try {
     const raw = localStorage.getItem(TOOLBAR_PREFS_KEY);
     if (!raw) return DEFAULT_VISIBLE_TOOLBAR_IDS;
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return DEFAULT_VISIBLE_TOOLBAR_IDS;
-    const ids = parsed.filter((item): item is ToolbarItemId => typeof item === "string" && isToolbarItemId(item));
-    return ids.length > 0 ? ids : DEFAULT_VISIBLE_TOOLBAR_IDS;
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : DEFAULT_VISIBLE_TOOLBAR_IDS;
   } catch {
     return DEFAULT_VISIBLE_TOOLBAR_IDS;
   }
 }
 
-function App() {
+function findNode(nodes: BinderNode[], id: string): BinderNode | null {
+  for (const node of nodes) {
+    if (node.id === id) return node;
+    const child = findNode(node.children, id);
+    if (child) return child;
+  }
+  return null;
+}
+
+function countNodes(nodes: BinderNode[]): number {
+  return nodes.reduce((total, node) => total + 1 + countNodes(node.children), 0);
+}
+
+function firstNode(nodes: BinderNode[]): BinderNode | null {
+  if (nodes.length === 0) return null;
+  return nodes[0];
+}
+
+function nodeKey(collection: BinderCollection, id: string) {
+  return `${collection}:${id}`;
+}
+
+export default function App() {
   const [view, setView] = useState<View>("splash");
   const [projects, setProjects] = useState<ProjectRecord[]>(() => loadRecentProjects());
-  const [selectedId, setSelectedId] = useState("");
+  const [selectedProjectId, setSelectedProjectId] = useState("");
   const [currentProject, setCurrentProject] = useState<ProjectRecord | null>(null);
-  const [workspaceMode, setWorkspaceMode] = useState<WorkspaceMode>("manuscript");
-  const [documents, setDocuments] = useState<DocumentRecord[]>([]);
-  const [activeDocumentId, setActiveDocumentId] = useState("");
+  const [binder, setBinder] = useState<BinderState>(EMPTY_BINDER);
+  const [activeCollection, setActiveCollection] = useState<BinderCollection>("draft");
+  const [activeNodeId, setActiveNodeId] = useState("");
   const [documentHtml, setDocumentHtml] = useState("");
   const [modalMode, setModalMode] = useState<ModalMode>(null);
   const [modalProject, setModalProject] = useState<ProjectRecord | null>(null);
-  const [modalDocument, setModalDocument] = useState<DocumentRecord | null>(null);
+  const [nodeTarget, setNodeTarget] = useState<NodeTarget | null>(null);
   const [projectNameInput, setProjectNameInput] = useState("");
-  const [documentTitleInput, setDocumentTitleInput] = useState("");
   const [pathInput, setPathInput] = useState("");
+  const [nodeTitleInput, setNodeTitleInput] = useState("");
+  const [nodeIconInput, setNodeIconInput] = useState("▦");
   const [linkUrlInput, setLinkUrlInput] = useState("");
   const [imageUrlInput, setImageUrlInput] = useState("");
-  const [slashMenuOpen, setSlashMenuOpen] = useState(false);
-  const [toolbarMoreOpen, setToolbarMoreOpen] = useState(false);
-  const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
-  const [aiPanelOpen, setAiPanelOpen] = useState(false);
   const [statusMessage, setStatusMessage] = useState("");
   const [isBusy, setIsBusy] = useState(false);
+  const [leftSidebarOpen, setLeftSidebarOpen] = useState(true);
+  const [aiPanelOpen, setAiPanelOpen] = useState(false);
+  const [toolbarMoreOpen, setToolbarMoreOpen] = useState(false);
+  const [visibleToolbarIds, setVisibleToolbarIds] = useState<ToolbarItemId[]>(() => loadToolbarVisibleIds());
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({
+    "draft:draft-root": true,
+    "outline:outline-root": true,
+  });
+  const [openBinderMenu, setOpenBinderMenu] = useState("");
+  const [slashMenuOpen, setSlashMenuOpen] = useState(false);
   const [editorTick, setEditorTick] = useState(0);
-  const [visibleToolbarIds, setVisibleToolbarIds] = useState<ToolbarItemId[]>(() => loadToolbarPreferences());
+
   const saveTimerRef = useRef<number | null>(null);
 
   const selectedProject = useMemo(
-    () => projects.find((project) => project.id === selectedId) ?? null,
-    [projects, selectedId],
+    () => projects.find((project) => project.id === selectedProjectId) ?? null,
+    [projects, selectedProjectId],
   );
 
-  const activeDocument = useMemo(
-    () => documents.find((doc) => doc.id === activeDocumentId) ?? null,
-    [documents, activeDocumentId],
-  );
-
-  const workspaceLabels = workspaceMode === "outline"
-    ? { module: "大纲", section: "自由写作", listTitle: "自由写作大纲", volume: "大纲资料库", empty: "还没有大纲", createButton: "新建大纲", createPlaceholder: "例如：主线大纲" }
-    : { module: "写作", section: "正文", listTitle: "正文草稿", volume: `第一卷：${currentProject?.name ?? "未命名项目"}`, empty: "还没有文档", createButton: "新建文档", createPlaceholder: "例如：第一章" };
+  const activeRoot = binder[activeCollection];
+  const activeNode = activeNodeId ? findNode(activeRoot.children, activeNodeId) : null;
 
   const editor = useEditor({
     extensions: [
@@ -319,7 +339,12 @@ function App() {
       TableCell,
       CharacterCount,
       Placeholder.configure({
-        placeholder: ({ node }) => (node.type.name === "heading" ? "请输入标题……" : "开始写作或整理大纲，输入 / 可打开快捷菜单……"),
+        placeholder: ({ node }) => {
+          if (node.type.name === "heading") return "请输入标题……";
+          return activeCollection === "outline"
+            ? "在这里记录大纲、结构、伏笔和人物弧线……"
+            : "开始写作，输入 / 可打开快捷菜单……";
+        },
       }),
     ],
     content: "",
@@ -331,22 +356,30 @@ function App() {
           return false;
         },
         keydown: (_view, event) => {
-          if (event.key === "Escape") setSlashMenuOpen(false);
-          if (event.key === "/") window.setTimeout(() => setSlashMenuOpen(true), 0);
+          if (event.key === "Escape") {
+            setSlashMenuOpen(false);
+            setToolbarMoreOpen(false);
+            setOpenBinderMenu("");
+          }
+          if (event.key === "/") {
+            window.setTimeout(() => setSlashMenuOpen(true), 0);
+          }
           return false;
         },
       },
     },
-    onUpdate: ({ editor: nextEditor }) => {
-      setDocumentHtml(nextEditor.getHTML());
+    onUpdate: ({ editor }) => {
+      setDocumentHtml(editor.getHTML());
       setEditorTick((value) => value + 1);
       scheduleSave();
     },
-    onSelectionUpdate: () => setEditorTick((value) => value + 1),
+    onSelectionUpdate: () => {
+      setEditorTick((value) => value + 1);
+    },
   });
 
   useEffect(() => {
-    const timer = window.setTimeout(() => setView("projects"), 450);
+    const timer = window.setTimeout(() => setView("projects"), 350);
     return () => window.clearTimeout(timer);
   }, []);
 
@@ -361,13 +394,13 @@ function App() {
   }, [view]);
 
   useEffect(() => {
-    if (!editor || !isEditorView()) return;
+    if (!editor) return;
     const current = editor.getHTML();
     if (current !== documentHtml) {
       editor.commands.setContent(documentHtml || "", false);
       setEditorTick((value) => value + 1);
     }
-  }, [editor, documentHtml, activeDocumentId, view, workspaceMode]);
+  }, [editor, documentHtml, activeNodeId, activeCollection]);
 
   useEffect(() => {
     return () => {
@@ -382,56 +415,18 @@ function App() {
 
   function showStatus(message: string) {
     setStatusMessage(message);
-    window.setTimeout(() => setStatusMessage(""), 4200);
-  }
-
-  function isEditorView(nextView: View = view) {
-    return nextView === "writer" || nextView === "outlineWriter";
-  }
-
-  function collectionCommands(mode: WorkspaceMode = workspaceMode) {
-    if (mode === "outline") {
-      return {
-        list: "list_outline_documents",
-        create: "create_outline_document",
-        rename: "rename_outline_document",
-        delete: "delete_outline_document",
-        read: "read_outline_document",
-        save: "save_outline_document",
-      } as const;
-    }
-    return {
-      list: "list_documents",
-      create: "create_document",
-      rename: "rename_document",
-      delete: "delete_document",
-      read: "read_document",
-      save: "save_document",
-    } as const;
-  }
-
-  function openEditorView(mode: WorkspaceMode) {
-    setWorkspaceMode(mode);
-    setToolbarMoreOpen(false);
-    setSlashMenuOpen(false);
-    setView(mode === "outline" ? "outlineWriter" : "writer");
-  }
-
-  function closeEditorToParent() {
-    void saveActiveDocument(false);
-    setToolbarMoreOpen(false);
-    setSlashMenuOpen(false);
-    setView(workspaceMode === "outline" ? "outline" : "hub");
+    window.setTimeout(() => setStatusMessage(""), 4500);
   }
 
   function closeModal() {
     if (isBusy) return;
     setModalMode(null);
     setModalProject(null);
-    setModalDocument(null);
+    setNodeTarget(null);
     setProjectNameInput("");
-    setDocumentTitleInput("");
     setPathInput("");
+    setNodeTitleInput("");
+    setNodeIconInput("▦");
     setLinkUrlInput("");
     setImageUrlInput("");
   }
@@ -439,60 +434,47 @@ function App() {
   function closeModalAfterBusy() {
     setModalMode(null);
     setModalProject(null);
-    setModalDocument(null);
+    setNodeTarget(null);
     setProjectNameInput("");
-    setDocumentTitleInput("");
     setPathInput("");
+    setNodeTitleInput("");
+    setNodeIconInput("▦");
     setLinkUrlInput("");
     setImageUrlInput("");
   }
 
-  function openCreateModal() {
-    setModalMode("create");
-    setModalProject(null);
+  function openCreateProjectModal() {
+    setModalMode("createProject");
     setProjectNameInput("");
     setPathInput("");
   }
 
-  function openImportModal() {
-    setModalMode("import");
-    setModalProject(null);
+  function openImportProjectModal() {
+    setModalMode("importProject");
     setProjectNameInput("");
     setPathInput("");
   }
 
-  function openRenameModal(project: ProjectRecord) {
-    setModalMode("rename");
+  function openRenameProjectModal(project: ProjectRecord) {
     setModalProject(project);
     setProjectNameInput(project.name);
     setPathInput(project.path);
+    setModalMode("renameProject");
   }
 
-  function openRelocateModal(project: ProjectRecord) {
-    setModalMode("relocate");
+  function openRelocateProjectModal(project: ProjectRecord) {
     setModalProject(project);
     setProjectNameInput(project.name);
     setPathInput(project.path);
+    setModalMode("relocateProject");
   }
 
-  function openActionsModal(project: ProjectRecord) {
-    setSelectedId(project.id);
+  function openProjectActionsModal(project: ProjectRecord) {
+    setSelectedProjectId(project.id);
     setModalProject(project);
-    setModalMode("actions");
     setProjectNameInput(project.name);
     setPathInput(project.path);
-  }
-
-  function openCreateDocumentModal() {
-    setDocumentTitleInput("");
-    setModalDocument(null);
-    setModalMode("createDocument");
-  }
-
-  function openRenameDocumentModal(document: DocumentRecord) {
-    setModalDocument(document);
-    setDocumentTitleInput(document.title);
-    setModalMode("renameDocument");
+    setModalMode("projectActions");
   }
 
   async function chooseFolderForInput(kind: "create" | "project") {
@@ -535,9 +517,9 @@ function App() {
       const created = await invoke<ProjectRecord>("create_project", { name, parentPath });
       const nextProjects = [created, ...projects.filter((project) => project.id !== created.id)];
       updateProjects(nextProjects);
-      setSelectedId(created.id);
+      setSelectedProjectId(created.id);
       closeModalAfterBusy();
-      showStatus(`项目已创建：${created.name}`);
+      showStatus(`项目已创建，档案存放位置：${created.path}`);
     } catch (error) {
       showStatus(`创建失败：${String(error)}`);
     } finally {
@@ -553,9 +535,9 @@ function App() {
       const imported = await invoke<ProjectRecord>("import_project", { path });
       const nextProjects = [imported, ...projects.filter((project) => project.id !== imported.id)];
       updateProjects(nextProjects);
-      setSelectedId(imported.id);
+      setSelectedProjectId(imported.id);
       closeModalAfterBusy();
-      showStatus(`已打开项目：${imported.name}`);
+      showStatus(`已记住项目位置：${imported.path}`);
     } catch (error) {
       showStatus(`打开失败：${String(error)}`);
     } finally {
@@ -566,7 +548,7 @@ function App() {
   async function openProject() {
     if (!selectedProject) return;
     if (selectedProject.exists === false) {
-      openRelocateModal(selectedProject);
+      openRelocateProjectModal(selectedProject);
       showStatus("项目文件未找到，请输入新的项目位置。");
       return;
     }
@@ -580,13 +562,24 @@ function App() {
         updatedAt: manifest.updatedAt,
         exists: true,
       };
-      updateProjects([updatedProject, ...projects.filter((project) => project.id !== updatedProject.id)]);
+      const nextBinder = await invoke<BinderState>("read_binder", { path: updatedProject.path });
+      setBinder(nextBinder);
       setCurrentProject(updatedProject);
-      setView("hub");
-    } catch {
-      showStatus("项目文件未找到，请重新定位该项目。");
-      updateProjects(projects.map((project) => (project.id === selectedProject.id ? { ...project, exists: false } : project)));
-      openRelocateModal(selectedProject);
+      updateProjects([updatedProject, ...projects.filter((project) => project.id !== updatedProject.id)]);
+      const firstDraft = firstNode(nextBinder.draft.children);
+      setActiveCollection("draft");
+      if (firstDraft) {
+        setActiveNodeId(firstDraft.id);
+        const html = await invoke<string>("read_binder_document", { path: updatedProject.path, documentId: firstDraft.id });
+        setDocumentHtml(html);
+      } else {
+        setActiveNodeId("");
+        setDocumentHtml("");
+      }
+      setExpanded({ "draft:draft-root": true, "outline:outline-root": true });
+      setView("writer");
+    } catch (error) {
+      showStatus(`打开失败：${String(error)}`);
     } finally {
       setIsBusy(false);
     }
@@ -596,20 +589,12 @@ function App() {
     if (!modalProject) return;
     const name = projectNameInput.trim();
     if (!name) return showStatus("请输入新的项目名称。");
-    if (name === modalProject.name) return closeModal();
     setIsBusy(true);
     try {
       const manifest = await invoke<ProjectManifest>("rename_project", { path: modalProject.path, name });
-      updateProjects(
-        projects.map((item) =>
-          item.id === modalProject.id
-            ? { ...item, name: manifest.name, updatedAt: manifest.updatedAt, exists: true }
-            : item,
-        ),
-      );
-      if (currentProject?.id === modalProject.id) {
-        setCurrentProject({ ...currentProject, name: manifest.name, updatedAt: manifest.updatedAt, exists: true });
-      }
+      const nextProject = { ...modalProject, name: manifest.name, updatedAt: manifest.updatedAt, exists: true };
+      updateProjects(projects.map((item) => (item.id === modalProject.id ? nextProject : item)));
+      if (currentProject?.id === modalProject.id) setCurrentProject(nextProject);
       closeModalAfterBusy();
       showStatus("项目名称已修改。");
     } catch (error) {
@@ -631,10 +616,9 @@ function App() {
         ...projects.filter((item) => item.id !== imported.id && item.id !== modalProject.id),
       ];
       updateProjects(nextProjects);
-      setSelectedId(imported.id);
-      setCurrentProject(imported);
+      setSelectedProjectId(imported.id);
       closeModalAfterBusy();
-      showStatus(`已重新定位：${imported.path}`);
+      showStatus(`已重新记住项目位置：${imported.path}`);
     } catch (error) {
       showStatus(`重新定位失败：${String(error)}`);
     } finally {
@@ -644,87 +628,46 @@ function App() {
 
   function removeFromRecent(project: ProjectRecord) {
     updateProjects(projects.filter((item) => item.id !== project.id));
-    if (selectedId === project.id) setSelectedId("");
+    if (selectedProjectId === project.id) setSelectedProjectId("");
     closeModalAfterBusy();
     showStatus(`已从最近项目列表移除：${project.name}`);
   }
 
-  async function loadDocuments(project = currentProject, mode: WorkspaceMode = workspaceMode) {
-    if (!project) return [];
-    const commands = collectionCommands(mode);
-    const nextDocuments = await invoke<DocumentRecord[]>(commands.list, { path: project.path });
-    setDocuments(nextDocuments);
-    return nextDocuments;
-  }
-
-  async function enterWorkspace(mode: WorkspaceMode) {
-    if (!currentProject) return;
+  async function selectBinderCollection(collection: BinderCollection) {
+    if (collection === activeCollection) return;
     await saveActiveDocument(false);
-    setWorkspaceMode(mode);
-    setDocuments([]);
-    setActiveDocumentId("");
-    setDocumentHtml("");
-    setIsBusy(true);
-    try {
-      const nextDocuments = await loadDocuments(currentProject, mode);
-      const firstDoc = nextDocuments[0];
-      if (firstDoc) {
-        setActiveDocumentId(firstDoc.id);
-        const html = await invoke<string>(collectionCommands(mode).read, {
-          path: currentProject.path,
-          documentId: firstDoc.id,
-        });
-        setDocumentHtml(html);
-      } else {
-        setActiveDocumentId("");
-        setDocumentHtml("");
-      }
-      openEditorView(mode);
-    } catch (error) {
-      showStatus(`${mode === "outline" ? "读取大纲" : "读取文档"}失败：${String(error)}`);
-    } finally {
-      setIsBusy(false);
+    setActiveCollection(collection);
+    setToolbarMoreOpen(false);
+    setOpenBinderMenu("");
+    const nextRoot = binder[collection];
+    const selected = firstNode(nextRoot.children);
+    if (!currentProject || !selected) {
+      setActiveNodeId("");
+      setDocumentHtml("");
+      return;
     }
-  }
-
-  async function enterWriter() {
-    await enterWorkspace("manuscript");
-  }
-
-  async function enterOutlineFreeWriting() {
-    await enterWorkspace("outline");
-  }
-
-  async function selectDocument(document: DocumentRecord) {
-    if (!currentProject || document.id === activeDocumentId) return;
-    await saveActiveDocument(false);
-    setActiveDocumentId(document.id);
+    setActiveNodeId(selected.id);
     try {
-      const html = await invoke<string>(collectionCommands().read, { path: currentProject.path, documentId: document.id });
+      const html = await invoke<string>("read_binder_document", { path: currentProject.path, documentId: selected.id });
       setDocumentHtml(html);
     } catch (error) {
-      showStatus(`${workspaceMode === "outline" ? "读取大纲" : "读取文档"}失败：${String(error)}`);
+      showStatus(`读取文稿失败：${String(error)}`);
     }
   }
 
-  async function saveActiveDocument(showSaved = true, nextHtml?: string) {
-    if (!currentProject || !activeDocumentId) return;
-    const content = nextHtml ?? editor?.getHTML() ?? documentHtml;
+  async function selectBinderNode(collection: BinderCollection, node: BinderNode) {
+    if (collection === activeCollection && node.id === activeNodeId) return;
+    await saveActiveDocument(false);
+    setActiveCollection(collection);
+    setActiveNodeId(node.id);
+    setToolbarMoreOpen(false);
+    setOpenBinderMenu("");
+    if (!currentProject) return;
     try {
-      const manifest = await invoke<ProjectManifest>(collectionCommands().save, {
-        path: currentProject.path,
-        documentId: activeDocumentId,
-        content,
-      });
-      const updatedProject = { ...currentProject, updatedAt: manifest.updatedAt, exists: true };
-      setCurrentProject(updatedProject);
-      updateProjects(projects.map((item) => (item.id === updatedProject.id ? updatedProject : item)));
-      setDocuments((items) =>
-        items.map((doc) => (doc.id === activeDocumentId ? { ...doc, updatedAt: manifest.updatedAt } : doc)),
-      );
-      if (showSaved) showStatus("已保存。");
+      const html = await invoke<string>("read_binder_document", { path: currentProject.path, documentId: node.id });
+      setDocumentHtml(html);
     } catch (error) {
-      showStatus(`保存失败：${String(error)}`);
+      showStatus(`读取文稿失败：${String(error)}`);
     }
   }
 
@@ -735,75 +678,152 @@ function App() {
     }, 900);
   }
 
-  async function createDocument() {
-    if (!currentProject) return;
-    const title = documentTitleInput.trim();
-    if (!title) return showStatus(workspaceMode === "outline" ? "请输入大纲名称。" : "请输入文档名称。");
+  async function saveActiveDocument(showSaved = true, nextHtml?: string) {
+    if (!currentProject || !activeNodeId) return;
+    const content = nextHtml ?? editor?.getHTML() ?? documentHtml;
+    try {
+      const manifest = await invoke<ProjectManifest>("save_binder_document", {
+        path: currentProject.path,
+        documentId: activeNodeId,
+        content,
+      });
+      const updatedProject = { ...currentProject, updatedAt: manifest.updatedAt, exists: true };
+      setCurrentProject(updatedProject);
+      updateProjects(projects.map((item) => (item.id === updatedProject.id ? updatedProject : item)));
+      if (showSaved) showStatus("已保存。");
+    } catch (error) {
+      showStatus(`保存失败：${String(error)}`);
+    }
+  }
+
+  function openCreateNodeModal(collection: BinderCollection, parentId?: string) {
+    setNodeTarget({ collection, parentId });
+    setNodeTitleInput(collection === "outline" ? "新的大纲" : "新的文稿");
+    setNodeIconInput(collection === "outline" ? "◇" : "▦");
+    setModalMode("createNode");
+    setOpenBinderMenu("");
+  }
+
+  function openEditRootModal(collection: BinderCollection) {
+    const root = binder[collection];
+    setNodeTarget({ collection, isRoot: true });
+    setNodeTitleInput(root.title);
+    setNodeIconInput(root.icon || (collection === "outline" ? "🧭" : "📚"));
+    setModalMode("editNode");
+    setOpenBinderMenu("");
+  }
+
+  function openEditNodeModal(collection: BinderCollection, node: BinderNode) {
+    setNodeTarget({ collection, nodeId: node.id });
+    setNodeTitleInput(node.title);
+    setNodeIconInput(node.icon || "▦");
+    setModalMode("editNode");
+    setOpenBinderMenu("");
+  }
+
+  async function createBinderNode() {
+    if (!currentProject || !nodeTarget) return;
+    const title = nodeTitleInput.trim();
+    const icon = nodeIconInput.trim() || (nodeTarget.collection === "outline" ? "◇" : "▦");
+    if (!title) return showStatus("请输入标题。");
     setIsBusy(true);
     try {
-      const nextDocuments = await invoke<DocumentRecord[]>(collectionCommands().create, { path: currentProject.path, title });
-      setDocuments(nextDocuments);
-      const created = nextDocuments.find((doc) => !documents.some((oldDoc) => oldDoc.id === doc.id)) ?? nextDocuments[nextDocuments.length - 1];
-      if (created) {
-        setActiveDocumentId(created.id);
-        setDocumentHtml("");
+      const nextBinder = await invoke<BinderState>("create_binder_document", {
+        path: currentProject.path,
+        collection: nodeTarget.collection,
+        parentId: nodeTarget.parentId ?? null,
+        title,
+        icon,
+      });
+      setBinder(nextBinder);
+      if (nodeTarget.parentId) {
+        setExpanded((items) => ({ ...items, [nodeKey(nodeTarget.collection, nodeTarget.parentId!)]: true }));
       }
       closeModalAfterBusy();
-      showStatus(workspaceMode === "outline" ? "大纲已创建。" : "文档已创建。");
+      showStatus("文稿已创建。");
     } catch (error) {
-      showStatus(`${workspaceMode === "outline" ? "创建大纲" : "创建文档"}失败：${String(error)}`);
+      showStatus(`创建失败：${String(error)}`);
     } finally {
       setIsBusy(false);
     }
   }
 
-  async function renameDocument() {
-    if (!currentProject || !modalDocument) return;
-    const title = documentTitleInput.trim();
-    if (!title) return showStatus(workspaceMode === "outline" ? "请输入大纲名称。" : "请输入文档名称。");
+  async function saveBinderItemEdit() {
+    if (!currentProject || !nodeTarget) return;
+    const title = nodeTitleInput.trim();
+    const icon = nodeIconInput.trim() || "▦";
+    if (!title) return showStatus("请输入标题。");
     setIsBusy(true);
     try {
-      const nextDocuments = await invoke<DocumentRecord[]>(collectionCommands().rename, {
-        path: currentProject.path,
-        documentId: modalDocument.id,
-        title,
-      });
-      setDocuments(nextDocuments);
+      const nextBinder = nodeTarget.isRoot
+        ? await invoke<BinderState>("update_binder_root", {
+            path: currentProject.path,
+            collection: nodeTarget.collection,
+            title,
+            icon,
+          })
+        : await invoke<BinderState>("rename_binder_document", {
+            path: currentProject.path,
+            collection: nodeTarget.collection,
+            documentId: nodeTarget.nodeId,
+            title,
+            icon,
+          });
+      setBinder(nextBinder);
       closeModalAfterBusy();
-      showStatus(workspaceMode === "outline" ? "大纲已重命名。" : "文档已重命名。");
+      showStatus("已更新标题与图标。");
     } catch (error) {
-      showStatus(`${workspaceMode === "outline" ? "重命名大纲" : "重命名文档"}失败：${String(error)}`);
+      showStatus(`更新失败：${String(error)}`);
     } finally {
       setIsBusy(false);
     }
   }
 
-  async function deleteDocument(document: DocumentRecord) {
+  async function deleteBinderNode(collection: BinderCollection, node: BinderNode) {
     if (!currentProject) return;
+    const accepted = window.confirm(`确定删除「${node.title}」及其所有子文稿吗？`);
+    if (!accepted) return;
     setIsBusy(true);
     try {
-      const nextDocuments = await invoke<DocumentRecord[]>(collectionCommands().delete, {
+      const nextBinder = await invoke<BinderState>("delete_binder_document", {
         path: currentProject.path,
-        documentId: document.id,
+        collection,
+        documentId: node.id,
       });
-      setDocuments(nextDocuments);
-      if (document.id === activeDocumentId) {
-        const nextActive = nextDocuments[0];
-        if (nextActive) {
-          setActiveDocumentId(nextActive.id);
-          const html = await invoke<string>(collectionCommands().read, { path: currentProject.path, documentId: nextActive.id });
+      setBinder(nextBinder);
+      if (activeCollection === collection && activeNodeId === node.id) {
+        const nextRoot = nextBinder[collection];
+        const nextNode = firstNode(nextRoot.children);
+        if (nextNode) {
+          setActiveNodeId(nextNode.id);
+          const html = await invoke<string>("read_binder_document", { path: currentProject.path, documentId: nextNode.id });
           setDocumentHtml(html);
         } else {
-          setActiveDocumentId("");
+          setActiveNodeId("");
           setDocumentHtml("");
         }
       }
-      showStatus(workspaceMode === "outline" ? "大纲已删除。" : "文档已删除。");
+      setOpenBinderMenu("");
+      showStatus("文稿已删除。");
     } catch (error) {
-      showStatus(`${workspaceMode === "outline" ? "删除大纲" : "删除文档"}失败：${String(error)}`);
+      showStatus(`删除失败：${String(error)}`);
     } finally {
       setIsBusy(false);
     }
+  }
+
+  function isExpanded(collection: BinderCollection, id: string) {
+    return expanded[nodeKey(collection, id)] ?? id.endsWith("-root");
+  }
+
+  function toggleExpanded(collection: BinderCollection, id: string) {
+    setExpanded((items) => ({ ...items, [nodeKey(collection, id)]: !isExpanded(collection, id) }));
+  }
+
+  function isEditorActive(command: string, attrs?: Record<string, unknown>) {
+    if (!editor) return false;
+    if (command === "textAlign") return editor.isActive(attrs ?? {});
+    return attrs ? editor.isActive(command, attrs) : editor.isActive(command);
   }
 
   function setHeading(level: 1 | 2 | 3 | 4) {
@@ -889,801 +909,547 @@ function App() {
     setSlashMenuOpen(false);
   }
 
-  function runToolbarCommand(id: ToolbarItemId) {
-    if (!editor) return;
-    setToolbarMoreOpen(false);
-    switch (id) {
-      case "undo":
-        editor.chain().focus().undo().run();
-        break;
-      case "redo":
-        editor.chain().focus().redo().run();
-        break;
-      case "paragraph":
-        setParagraph();
-        break;
-      case "h1":
-        setHeading(1);
-        break;
-      case "h2":
-        setHeading(2);
-        break;
-      case "h3":
-        setHeading(3);
-        break;
-      case "h4":
-        setHeading(4);
-        break;
-      case "bold":
-        editor.chain().focus().toggleBold().run();
-        break;
-      case "italic":
-        editor.chain().focus().toggleItalic().run();
-        break;
-      case "underline":
-        editor.chain().focus().toggleUnderline().run();
-        break;
-      case "strike":
-        editor.chain().focus().toggleStrike().run();
-        break;
-      case "code":
-        editor.chain().focus().toggleCode().run();
-        break;
-      case "alignLeft":
-        setTextAlign("left");
-        break;
-      case "alignCenter":
-        setTextAlign("center");
-        break;
-      case "alignRight":
-        setTextAlign("right");
-        break;
-      case "alignJustify":
-        setTextAlign("justify");
-        break;
-      case "bulletList":
-        editor.chain().focus().toggleBulletList().run();
-        break;
-      case "orderedList":
-        editor.chain().focus().toggleOrderedList().run();
-        break;
-      case "taskList":
-        editor.chain().focus().toggleTaskList().run();
-        break;
-      case "blockquote":
-        editor.chain().focus().toggleBlockquote().run();
-        break;
-      case "codeBlock":
-        editor.chain().focus().toggleCodeBlock().run();
-        break;
-      case "horizontalRule":
-        editor.chain().focus().setHorizontalRule().run();
-        break;
-      case "link":
-        openLinkModal();
-        break;
-      case "image":
-        openImageModal();
-        break;
-      case "table":
-        insertTable();
-        break;
-      case "addRow":
-        editor.chain().focus().addRowAfter().run();
-        break;
-      case "addColumn":
-        editor.chain().focus().addColumnAfter().run();
-        break;
-      case "mergeCells":
-        editor.chain().focus().mergeCells().run();
-        break;
-      case "splitCell":
-        editor.chain().focus().splitCell().run();
-        break;
-      case "deleteTable":
-        editor.chain().focus().deleteTable().run();
-        break;
-    }
+  function characterCount() {
+    if (!editor) return 0;
+    const storage = editor.storage as { characterCount?: { characters?: () => number } };
+    return storage.characterCount?.characters?.() ?? editor.state.doc.textContent.length;
   }
 
-  function isToolbarActive(id: ToolbarItemId) {
-    if (!editor) return false;
-    switch (id) {
-      case "paragraph":
-        return editor.isActive("paragraph");
-      case "h1":
-        return editor.isActive("heading", { level: 1 });
-      case "h2":
-        return editor.isActive("heading", { level: 2 });
-      case "h3":
-        return editor.isActive("heading", { level: 3 });
-      case "h4":
-        return editor.isActive("heading", { level: 4 });
-      case "bold":
-        return editor.isActive("bold");
-      case "italic":
-        return editor.isActive("italic");
-      case "underline":
-        return editor.isActive("underline");
-      case "strike":
-        return editor.isActive("strike");
-      case "code":
-        return editor.isActive("code");
-      case "alignLeft":
-        return editor.isActive({ textAlign: "left" });
-      case "alignCenter":
-        return editor.isActive({ textAlign: "center" });
-      case "alignRight":
-        return editor.isActive({ textAlign: "right" });
-      case "alignJustify":
-        return editor.isActive({ textAlign: "justify" });
-      case "bulletList":
-        return editor.isActive("bulletList");
-      case "orderedList":
-        return editor.isActive("orderedList");
-      case "taskList":
-        return editor.isActive("taskList");
-      case "blockquote":
-        return editor.isActive("blockquote");
-      case "codeBlock":
-        return editor.isActive("codeBlock");
-      case "link":
-        return editor.isActive("link");
-      case "table":
-      case "addRow":
-      case "addColumn":
-      case "mergeCells":
-      case "splitCell":
-      case "deleteTable":
-        return editor.isActive("table");
-      default:
-        return false;
-    }
+  function toolbarItems(): ToolbarItem[] {
+    const tableDisabled = () => !editor?.isActive("table");
+    return [
+      { id: "paragraph", title: "正文", icon: "¶", group: "format", run: setParagraph, active: () => isEditorActive("paragraph") },
+      { id: "h1", title: "一级标题", icon: "H1", group: "format", run: () => setHeading(1), active: () => isEditorActive("heading", { level: 1 }) },
+      { id: "h2", title: "二级标题", icon: "H2", group: "format", run: () => setHeading(2), active: () => isEditorActive("heading", { level: 2 }) },
+      { id: "h3", title: "三级标题", icon: "H3", group: "format", run: () => setHeading(3), active: () => isEditorActive("heading", { level: 3 }) },
+      { id: "h4", title: "四级标题", icon: "H4", group: "format", run: () => setHeading(4), active: () => isEditorActive("heading", { level: 4 }) },
+      { id: "bold", title: "加粗", icon: "B", group: "format", run: () => editor?.chain().focus().toggleBold().run(), active: () => isEditorActive("bold") },
+      { id: "italic", title: "斜体", icon: "I", group: "format", run: () => editor?.chain().focus().toggleItalic().run(), active: () => isEditorActive("italic") },
+      { id: "underline", title: "下划线", icon: "U", group: "format", run: () => editor?.chain().focus().toggleUnderline().run(), active: () => isEditorActive("underline") },
+      { id: "strike", title: "删除线", icon: "S", group: "format", run: () => editor?.chain().focus().toggleStrike().run(), active: () => isEditorActive("strike") },
+      { id: "code", title: "行内代码", icon: "</>", group: "format", run: () => editor?.chain().focus().toggleCode().run(), active: () => isEditorActive("code") },
+      { id: "quote", title: "引用", icon: "“”", group: "layout", run: () => editor?.chain().focus().toggleBlockquote().run(), active: () => isEditorActive("blockquote") },
+      { id: "codeBlock", title: "代码块", icon: "▣", group: "layout", run: () => editor?.chain().focus().toggleCodeBlock().run(), active: () => isEditorActive("codeBlock") },
+      { id: "left", title: "左对齐", icon: "☰", group: "layout", run: () => setTextAlign("left"), active: () => isEditorActive("textAlign", { textAlign: "left" }) },
+      { id: "center", title: "居中", icon: "≡", group: "layout", run: () => setTextAlign("center"), active: () => isEditorActive("textAlign", { textAlign: "center" }) },
+      { id: "right", title: "右对齐", icon: "☷", group: "layout", run: () => setTextAlign("right"), active: () => isEditorActive("textAlign", { textAlign: "right" }) },
+      { id: "justify", title: "两端对齐", icon: "▤", group: "layout", run: () => setTextAlign("justify"), active: () => isEditorActive("textAlign", { textAlign: "justify" }) },
+      { id: "bullet", title: "无序列表", icon: "•", group: "layout", run: () => editor?.chain().focus().toggleBulletList().run(), active: () => isEditorActive("bulletList") },
+      { id: "ordered", title: "有序列表", icon: "1.", group: "layout", run: () => editor?.chain().focus().toggleOrderedList().run(), active: () => isEditorActive("orderedList") },
+      { id: "task", title: "任务清单", icon: "☑", group: "layout", run: () => editor?.chain().focus().toggleTaskList().run(), active: () => isEditorActive("taskList") },
+      { id: "rule", title: "分隔线", icon: "—", group: "insert", run: () => editor?.chain().focus().setHorizontalRule().run() },
+      { id: "link", title: "链接", icon: "🔗", group: "insert", run: openLinkModal, active: () => isEditorActive("link") },
+      { id: "image", title: "图片", icon: "▧", group: "insert", run: openImageModal },
+      { id: "table", title: "插入表格", icon: "▦", group: "insert", run: insertTable },
+      { id: "row", title: "追加表格行", icon: "↕", group: "table", run: () => editor?.chain().focus().addRowAfter().run(), disabled: tableDisabled },
+      { id: "column", title: "追加表格列", icon: "↔", group: "table", run: () => editor?.chain().focus().addColumnAfter().run(), disabled: tableDisabled },
+      { id: "merge", title: "合并单元格", icon: "⇄", group: "table", run: () => editor?.chain().focus().mergeCells().run(), disabled: tableDisabled },
+      { id: "split", title: "拆分单元格", icon: "⇆", group: "table", run: () => editor?.chain().focus().splitCell().run(), disabled: tableDisabled },
+      { id: "deleteTable", title: "删除表格", icon: "×", group: "table", run: () => editor?.chain().focus().deleteTable().run(), disabled: tableDisabled },
+      { id: "fontSize", title: "字号", icon: "字", group: "style", control: "fontSize" },
+      { id: "lineHeight", title: "行高", icon: "↕", group: "style", control: "lineHeight" },
+      { id: "color", title: "文字颜色", icon: "A", group: "style", control: "color" },
+      { id: "highlight", title: "高亮", icon: "▰", group: "style", control: "highlight" },
+      { id: "undo", title: "撤销", icon: "↶", group: "history", run: () => editor?.chain().focus().undo().run() },
+      { id: "redo", title: "重做", icon: "↷", group: "history", run: () => editor?.chain().focus().redo().run() },
+    ];
   }
 
-  function isToolbarDisabled(id: ToolbarItemId) {
-    if (!editor) return true;
-    if (["addRow", "addColumn", "mergeCells", "splitCell", "deleteTable"].includes(id)) return !editor.isActive("table");
-    return false;
+  function renderToolbarButton(item: ToolbarItem, compact = false) {
+    if (item.control) return renderToolbarControl(item, compact);
+    const isActive = item.active?.() ?? false;
+    const isDisabled = item.disabled?.() ?? false;
+    return (
+      <button
+        key={item.id}
+        className={`toolbar-btn ${isActive ? "active" : ""} ${compact ? "compact" : ""}`}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => {
+          item.run?.();
+          if (compact) setToolbarMoreOpen(false);
+        }}
+        disabled={isDisabled}
+        title={item.title}
+        aria-label={item.title}
+      >
+        <span className="toolbar-icon">{item.icon}</span>
+        {compact ? <span>{item.title}</span> : null}
+      </button>
+    );
+  }
+
+  function renderToolbarControl(item: ToolbarItem, compact = false) {
+    if (!editor) return null;
+    const currentFontSize = editor.getAttributes("textStyle").fontSize ?? "18px";
+    const currentLineHeight = editor.getAttributes("paragraph").lineHeight || editor.getAttributes("heading").lineHeight || "1.8";
+    if (item.control === "fontSize") {
+      return (
+        <label key={item.id} className={`toolbar-select ${compact ? "compact" : ""}`} title={item.title}>
+          <span>字号</span>
+          <select
+            value={currentFontSize}
+            onMouseDown={(event) => event.stopPropagation()}
+            onChange={(event) => applyFontSize(event.currentTarget.value)}
+          >
+            {FONT_SIZE_OPTIONS.map((size) => (
+              <option key={size} value={size}>{size}</option>
+            ))}
+          </select>
+        </label>
+      );
+    }
+    if (item.control === "lineHeight") {
+      return (
+        <label key={item.id} className={`toolbar-select ${compact ? "compact" : ""}`} title={item.title}>
+          <span>行高</span>
+          <select
+            value={currentLineHeight}
+            onMouseDown={(event) => event.stopPropagation()}
+            onChange={(event) => applyLineHeight(event.currentTarget.value)}
+          >
+            {LINE_HEIGHT_OPTIONS.map((lineHeight) => (
+              <option key={lineHeight} value={lineHeight}>{lineHeight}</option>
+            ))}
+          </select>
+        </label>
+      );
+    }
+    if (item.control === "color") {
+      return (
+        <div key={item.id} className={`toolbar-palette ${compact ? "compact" : ""}`} title={item.title}>
+          <span>A</span>
+          {COLOR_PRESETS.map((color) => (
+            <button
+              key={color}
+              className="swatch"
+              style={{ backgroundColor: color }}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => editor.chain().focus().setColor(color).run()}
+              aria-label={`文字颜色 ${color}`}
+            />
+          ))}
+        </div>
+      );
+    }
+    return (
+      <div key={item.id} className={`toolbar-palette ${compact ? "compact" : ""}`} title={item.title}>
+        <span>▰</span>
+        {HIGHLIGHT_PRESETS.map((color) => (
+          <button
+            key={color}
+            className="swatch"
+            style={{ backgroundColor: color }}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => editor.chain().focus().toggleHighlight({ color }).run()}
+            aria-label={`高亮 ${color}`}
+          />
+        ))}
+      </div>
+    );
   }
 
   function toggleToolbarPreference(id: ToolbarItemId) {
     setVisibleToolbarIds((ids) => (ids.includes(id) ? ids.filter((item) => item !== id) : [...ids, id]));
   }
 
-  function characterCount() {
-    return editor?.state.doc.textContent.length ?? documentHtml.replace(/<[^>]*>/g, "").length;
-  }
-
-  function renderToolbarButton(item: ToolbarDefinition, compact = false) {
-    const active = isToolbarActive(item.id);
-    const disabled = isToolbarDisabled(item.id);
-    return (
-      <button
-        key={item.id}
-        className={`toolbar-button ${active ? "is-active" : ""} ${compact ? "is-compact" : ""}`}
-        disabled={disabled}
-        title={item.title}
-        aria-label={item.title}
-        onMouseDown={(event) => event.preventDefault()}
-        onClick={() => runToolbarCommand(item.id)}
-      >
-        <span className="toolbar-button-icon">{item.icon}</span>
-        {compact ? <span className="toolbar-button-label">{item.title}</span> : null}
-      </button>
-    );
-  }
-
   function renderEditorToolbar() {
     if (!editor) return null;
     void editorTick;
-    const visibleItems = TOOLBAR_CATALOG.filter((item) => visibleToolbarIds.includes(item.id));
-    const overflowItems = TOOLBAR_CATALOG.filter((item) => !visibleToolbarIds.includes(item.id));
-    const firstRow = visibleItems.filter((item) => ["format", "inline"].includes(item.group));
-    const secondRow = visibleItems.filter((item) => !["format", "inline"].includes(item.group));
-    const currentFontSize = editor.getAttributes("textStyle").fontSize ?? "18px";
-    const currentLineHeight = editor.getAttributes("paragraph").lineHeight || editor.getAttributes("heading").lineHeight || "1.8";
+    const allItems = toolbarItems();
+    const visibleItems = allItems.filter((item) => visibleToolbarIds.includes(item.id));
+    const overflowItems = allItems.filter((item) => !visibleToolbarIds.includes(item.id));
+    const firstRow = visibleItems.filter((item) => ["format", "history"].includes(item.group));
+    const secondRow = visibleItems.filter((item) => !["format", "history"].includes(item.group));
+    const breadcrumb = `${currentProject?.name ?? "未命名项目"} › ${activeRoot.title}${activeNode ? ` › ${activeNode.title}` : ""}`;
 
     return (
-      <div className="editor-toolbar-shell">
-        <div className="editor-toolbar-row editor-toolbar-topline">
-          <button className="icon-button" onClick={() => setLeftSidebarOpen((value) => !value)} title="显示/隐藏左侧栏">
-            ◧
-          </button>
-          <div className="toolbar-breadcrumbs">
-            <span>{currentProject?.name ?? "未命名项目"}</span>
-            <span>›</span>
-            <span>{workspaceLabels.module}</span>
-            <span>›</span>
-            <strong>{activeDocument?.title ?? "未选择文档"}</strong>
+      <header className="editor-toolbar">
+        <div className="toolbar-topline">
+          <div className="toolbar-left">
+            <button className="icon-btn" onClick={() => setLeftSidebarOpen((value) => !value)} title="显示/隐藏侧边栏">◧</button>
+            <div className="breadcrumb">{breadcrumb}</div>
           </div>
-          <div className="toolbar-spacer" />
-          <span className="word-count">{characterCount().toLocaleString("zh-CN")} 字</span>
-          <button className="icon-button" title="搜索">
-            ⌕
-          </button>
-          <button
-            className={`icon-button ai-toggle ${aiPanelOpen ? "is-active" : ""}`}
-            onClick={() => setAiPanelOpen((value) => !value)}
-            title="AI 助手"
-          >
-            ✨
-          </button>
+          <div className="toolbar-right">
+            <div className="count-pill">{characterCount().toLocaleString("zh-CN")} 字</div>
+            <button className="icon-btn" title="搜索">⌕</button>
+            <button className={`icon-btn ai ${aiPanelOpen ? "active" : ""}`} onClick={() => setAiPanelOpen((value) => !value)} title="AI 助手">✦</button>
+          </div>
         </div>
-
-        <div className="editor-toolbar-row">
+        <div className="toolbar-row">
           {firstRow.map((item) => renderToolbarButton(item))}
-          <div className="toolbar-divider" />
-          <select
-            className="toolbar-select"
-            value={currentFontSize}
-            onMouseDown={(event) => event.stopPropagation()}
-            onChange={(event) => applyFontSize(event.currentTarget.value)}
-            aria-label="字号"
-          >
-            {FONT_SIZE_OPTIONS.map((size) => (
-              <option key={size} value={size}>
-                字号 {size}
-              </option>
-            ))}
-          </select>
-          <select
-            className="toolbar-select"
-            value={currentLineHeight}
-            onMouseDown={(event) => event.stopPropagation()}
-            onChange={(event) => applyLineHeight(event.currentTarget.value)}
-            aria-label="行高"
-          >
-            {LINE_HEIGHT_OPTIONS.map((lineHeight) => (
-              <option key={lineHeight} value={lineHeight}>
-                行高 {lineHeight}
-              </option>
-            ))}
-          </select>
-          <button className="toolbar-button save-button" onMouseDown={(event) => event.preventDefault()} onClick={() => void saveActiveDocument(true)} title="保存">
-            <span className="toolbar-button-icon">✓</span>
-          </button>
+          <button className="toolbar-btn" onMouseDown={(event) => event.preventDefault()} onClick={() => setToolbarMoreOpen((value) => !value)} title="更多编辑按钮">…</button>
+          <button className="toolbar-btn save" onMouseDown={(event) => event.preventDefault()} onClick={() => void saveActiveDocument(true)} title="保存">✓</button>
         </div>
-
-        <div className="editor-toolbar-row toolbar-relative">
+        <div className="toolbar-row second">
           {secondRow.map((item) => renderToolbarButton(item))}
-          <div className="toolbar-divider" />
-          <div className="swatch-group" aria-label="文字颜色">
-            <span className="swatch-label">A</span>
-            {COLOR_PRESETS.map((color) => (
-              <button
-                key={color}
-                className="color-swatch"
-                style={{ backgroundColor: color }}
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={() => editor.chain().focus().setColor(color).run()}
-                aria-label={`文字颜色 ${color}`}
-              />
-            ))}
-          </div>
-          <div className="swatch-group" aria-label="高亮颜色">
-            <span className="swatch-label">▰</span>
-            {HIGHLIGHT_PRESETS.map((color) => (
-              <button
-                key={color}
-                className="color-swatch is-highlight"
-                style={{ backgroundColor: color }}
-                onMouseDown={(event) => event.preventDefault()}
-                onClick={() => editor.chain().focus().toggleHighlight({ color }).run()}
-                aria-label={`高亮 ${color}`}
-              />
-            ))}
-          </div>
-          <button
-            className={`toolbar-button more-button ${toolbarMoreOpen ? "is-active" : ""}`}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => setToolbarMoreOpen((value) => !value)}
-            title="更多编辑按钮"
-          >
-            <span className="toolbar-button-icon">…</span>
-          </button>
-          {toolbarMoreOpen ? (
-            <div className="toolbar-overflow-panel">
-              <div className="overflow-header">
-                <strong>更多编辑按钮</strong>
-                <button onClick={() => setModalMode("preferences")}>首选项…</button>
-              </div>
-              {Object.entries(TOOLBAR_GROUP_LABELS).map(([group, label]) => {
-                const items = overflowItems.filter((item) => item.group === group);
-                if (items.length === 0) return null;
-                return (
-                  <div className="overflow-group" key={group}>
-                    <h4>{label}</h4>
-                    <div className="overflow-grid">{items.map((item) => renderToolbarButton(item, true))}</div>
-                  </div>
-                );
-              })}
-              {overflowItems.length === 0 ? <p className="empty-overflow">所有按钮已显示在主工具栏。</p> : null}
+        </div>
+        {toolbarMoreOpen ? (
+          <div className="toolbar-more-panel">
+            <div className="toolbar-more-header">
+              <strong>更多编辑按钮</strong>
+              <button onClick={() => setModalMode("preferences")}>首选项…</button>
             </div>
-          ) : null}
-        </div>
-      </div>
-    );
-  }
-
-  function renderBubbleMenu() {
-    if (!editor) return null;
-    return (
-      <BubbleMenu editor={editor} tippyOptions={{ duration: 120 }}>
-        <div className="bubble-menu">
-          <button onClick={() => editor.chain().focus().toggleBold().run()}>B</button>
-          <button onClick={() => editor.chain().focus().toggleItalic().run()}>I</button>
-          <button onClick={() => editor.chain().focus().toggleHighlight({ color: "#fef08a" }).run()}>▰</button>
-          <button onClick={openLinkModal}>🔗</button>
-        </div>
-      </BubbleMenu>
-    );
-  }
-
-  function renderSlashMenu() {
-    if (!slashMenuOpen || !editor) return null;
-    return (
-      <div className="slash-menu">
-        <button onMouseDown={(event) => event.preventDefault()} onClick={() => applySlashCommand("heading1")}>
-          <strong>H1</strong> 一级标题
-        </button>
-        <button onMouseDown={(event) => event.preventDefault()} onClick={() => applySlashCommand("heading2")}>
-          <strong>H2</strong> 二级标题
-        </button>
-        <button onMouseDown={(event) => event.preventDefault()} onClick={() => applySlashCommand("bullet")}>
-          <strong>•</strong> 无序列表
-        </button>
-        <button onMouseDown={(event) => event.preventDefault()} onClick={() => applySlashCommand("task")}>
-          <strong>☑</strong> 任务清单
-        </button>
-        <button onMouseDown={(event) => event.preventDefault()} onClick={() => applySlashCommand("quote")}>
-          <strong>“”</strong> 引用
-        </button>
-        <button onMouseDown={(event) => event.preventDefault()} onClick={() => applySlashCommand("table")}>
-          <strong>▦</strong> 表格
-        </button>
-      </div>
-    );
-  }
-
-  function renderStatus() {
-    if (!statusMessage) return null;
-    return <div className="status-toast">{statusMessage}</div>;
-  }
-
-  function renderPreferencesModal() {
-    return (
-      <div className="modal-overlay" onClick={closeModal}>
-        <div className="modal-card preferences-card" onClick={(event) => event.stopPropagation()}>
-          <div className="modal-eyebrow">Preferences</div>
-          <div className="modal-title-row">
-            <h2>编辑栏首选项</h2>
-            <button className="ghost-button" onClick={() => setVisibleToolbarIds(DEFAULT_VISIBLE_TOOLBAR_IDS)}>
-              恢复默认
-            </button>
-          </div>
-          <p className="modal-muted">勾选后会显示在主编辑栏；未勾选的按钮会收纳到 “…” 菜单。主编辑栏按两排优先展示常用功能。</p>
-          <div className="preferences-grid">
             {Object.entries(TOOLBAR_GROUP_LABELS).map(([group, label]) => {
-              const items = TOOLBAR_CATALOG.filter((item) => item.group === group);
-              if (!items.length) return null;
+              const items = overflowItems.filter((item) => item.group === group);
+              if (items.length === 0) return null;
               return (
-                <section key={group} className="preference-group">
-                  <h3>{label}</h3>
-                  {items.map((item) => (
-                    <label key={item.id} className="preference-item">
-                      <input
-                        type="checkbox"
-                        checked={visibleToolbarIds.includes(item.id)}
-                        onChange={() => toggleToolbarPreference(item.id)}
-                      />
-                      <span className="preference-icon">{item.icon}</span>
-                      <span>{item.title}</span>
-                    </label>
-                  ))}
-                </section>
+                <div className="toolbar-more-group" key={group}>
+                  <h4>{label}</h4>
+                  <div>{items.map((item) => renderToolbarButton(item, true))}</div>
+                </div>
               );
             })}
+            {overflowItems.length === 0 ? <p className="muted small">所有按钮已显示在主工具栏。</p> : null}
           </div>
-          <div className="modal-actions">
-            <button className="primary-button" onClick={closeModal}>
-              完成
-            </button>
-          </div>
-        </div>
-      </div>
+        ) : null}
+      </header>
     );
   }
 
-  function renderModal() {
-    if (!modalMode) return null;
-    if (modalMode === "preferences") return renderPreferencesModal();
-
-    if (modalMode === "actions" && modalProject) {
-      return (
-        <div className="modal-overlay" onClick={closeModal}>
-          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
-            <h2>{modalProject.name}</h2>
-            <p className="modal-muted">请选择要执行的操作。</p>
-            <div className="modal-actions column-actions">
-              <button onClick={() => openRenameModal(modalProject)}>修改项目名称</button>
-              <button onClick={() => openRelocateModal(modalProject)}>重新定位项目文件</button>
-              <button className="danger-button" onClick={() => removeFromRecent(modalProject)}>
-                从列表删除
-              </button>
-              <button className="ghost-button" onClick={closeModal}>
-                取消
-              </button>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    if (modalMode === "insertLink" || modalMode === "insertImage") {
-      const isLink = modalMode === "insertLink";
-      return (
-        <div className="modal-overlay" onClick={closeModal}>
-          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
-            <h2>{isLink ? "插入/编辑链接" : "插入图片"}</h2>
-            <p className="modal-muted">{isLink ? "选中文字后输入链接地址；留空可移除链接。" : "当前版本先支持图片 URL，后续可接入本地图片资源库。"}</p>
-            <label className="form-label">
-              {isLink ? "链接地址" : "图片地址"}
-              <input
-                value={isLink ? linkUrlInput : imageUrlInput}
-                onChange={(event) => (isLink ? setLinkUrlInput(event.currentTarget.value) : setImageUrlInput(event.currentTarget.value))}
-                placeholder={isLink ? "https://example.com" : "https://example.com/image.png"}
-              />
-            </label>
-            <div className="modal-actions">
-              <button className="ghost-button" onClick={closeModal}>
-                取消
-              </button>
-              <button className="primary-button" onClick={isLink ? applyLink : applyImage}>
-                确定
-              </button>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    if (modalMode === "createDocument" || modalMode === "renameDocument") {
-      const submit = modalMode === "createDocument" ? createDocument : renameDocument;
-      return (
-        <div className="modal-overlay" onClick={closeModal}>
-          <div className="modal-card" onClick={(event) => event.stopPropagation()}>
-            <h2>{modalMode === "createDocument" ? workspaceLabels.createButton : workspaceMode === "outline" ? "重命名大纲" : "重命名文档"}</h2>
-            <label className="form-label">
-              {workspaceMode === "outline" ? "大纲名称" : "文档名称"}
-              <input value={documentTitleInput} onChange={(event) => setDocumentTitleInput(event.currentTarget.value)} placeholder={workspaceLabels.createPlaceholder} />
-            </label>
-            <div className="modal-actions">
-              <button className="ghost-button" onClick={closeModal}>
-                取消
-              </button>
-              <button className="primary-button" onClick={() => void submit()} disabled={isBusy}>
-                {isBusy ? "处理中…" : "确定"}
-              </button>
-            </div>
-          </div>
-        </div>
-      );
-    }
-
-    const title = modalMode === "create" ? "创建项目" : modalMode === "import" ? "打开已有项目" : modalMode === "rename" ? "修改项目名称" : "重新定位项目";
-    const confirmLabel = modalMode === "create" ? "创建" : modalMode === "import" ? "打开" : modalMode === "rename" ? "保存名称" : "保存新位置";
-    const submit = modalMode === "create" ? createProject : modalMode === "import" ? importExistingProject : modalMode === "rename" ? renameProject : relocateProject;
-
+  function renderBinderRoot(collection: BinderCollection) {
+    const root = binder[collection];
+    const rootKey = nodeKey(collection, root.id);
+    const expandedRoot = isExpanded(collection, root.id);
+    const active = activeCollection === collection;
     return (
-      <div className="modal-overlay" onClick={closeModal}>
-        <div className="modal-card" onClick={(event) => event.stopPropagation()}>
-          <h2>{title}</h2>
-          {modalMode === "create" || modalMode === "rename" ? (
-            <label className="form-label">
-              项目名称
-              <input value={projectNameInput} onChange={(event) => setProjectNameInput(event.currentTarget.value)} placeholder="例如：我的小说" />
-            </label>
+      <div className="binder-section" key={collection}>
+        <div className={`binder-root-row ${active ? "active" : ""}`}>
+          <button className="disclosure" onClick={() => toggleExpanded(collection, root.id)}>{expandedRoot ? "⌄" : "›"}</button>
+          <button className="binder-icon" onClick={() => openEditRootModal(collection)} title="修改根目录图标">{root.icon}</button>
+          <button className="binder-title" onClick={() => void selectBinderCollection(collection)}>{root.title}</button>
+          <button className="mini-action" onClick={() => openCreateNodeModal(collection, root.id)} title="添加文稿">＋</button>
+          <button className="mini-action" onClick={() => setOpenBinderMenu(openBinderMenu === rootKey ? "" : rootKey)} title="更多">…</button>
+          {openBinderMenu === rootKey ? (
+            <div className="binder-context-menu">
+              <button onClick={() => openCreateNodeModal(collection, root.id)}>添加子文稿</button>
+              <button onClick={() => openEditRootModal(collection)}>重命名 / 图标</button>
+            </div>
           ) : null}
-          {modalMode === "create" ? (
-            <label className="form-label">
-              存档文件夹
-              <div className="input-row">
-                <input value={pathInput} onChange={(event) => setPathInput(event.currentTarget.value)} placeholder="请选择文件夹" />
-                <button onClick={() => void chooseFolderForInput("create")}>选择…</button>
-              </div>
-              <small>程序会在这个文件夹里创建一个 .masterpiece 项目档案。</small>
-            </label>
-          ) : null}
-          {modalMode === "import" || modalMode === "relocate" ? (
-            <label className="form-label">
-              项目文件夹
-              <div className="input-row">
-                <input value={pathInput} onChange={(event) => setPathInput(event.currentTarget.value)} placeholder="请选择 .masterpiece 项目文件夹" />
-                <button onClick={() => void chooseFolderForInput("project")}>选择…</button>
-              </div>
-              <small>请选择或输入以 .masterpiece 结尾的项目文件夹。</small>
-            </label>
-          ) : null}
-          <div className="modal-actions">
-            <button className="ghost-button" onClick={closeModal}>
-              取消
-            </button>
-            <button className="primary-button" onClick={() => void submit()} disabled={isBusy}>
-              {isBusy ? "处理中…" : confirmLabel}
-            </button>
-          </div>
         </div>
+        {expandedRoot ? (
+          <div className="binder-children">
+            {root.children.map((node) => renderBinderNode(collection, node, 1))}
+            {root.children.length === 0 ? (
+              <button className="empty-add" onClick={() => openCreateNodeModal(collection, root.id)}>＋ 添加第一个文稿</button>
+            ) : null}
+          </div>
+        ) : null}
       </div>
     );
   }
 
-  function renderProjectList() {
+  function renderBinderNode(collection: BinderCollection, node: BinderNode, depth: number): React.ReactNode {
+    const hasChildren = node.children.length > 0;
+    const expandedNode = isExpanded(collection, node.id);
+    const key = nodeKey(collection, node.id);
+    const active = activeCollection === collection && activeNodeId === node.id;
     return (
-      <div className="mastps-app project-screen">
-        <div className="ambient-layer" />
-        {renderStatus()}
-        {renderModal()}
-        <section className="project-hero">
-          <div>
-            <span className="hero-eyebrow">MasterPieces</span>
-            <h1>选择项目</h1>
-          </div>
-          <div className="hero-actions">
-            <button className="secondary-button" onClick={openImportModal}>
-              打开已有项目
-            </button>
-            <button className="square-primary-button" onClick={openCreateModal} title="创建项目">
-              +
-            </button>
-          </div>
-        </section>
-        <section className="project-table-card">
-          <div className="project-table-header">
-            <span>序号</span>
-            <span>项目名称</span>
-            <span>最后修改时间</span>
-            <span>创建时间</span>
-          </div>
-          {projects.length === 0 ? <div className="empty-row">暂无项目，请点击右上角 + 创建。</div> : null}
-          {projects.map((project, index) => (
-            <button
-              key={project.id}
-              className={`project-row ${selectedId === project.id ? "is-selected" : ""}`}
-              onClick={() => setSelectedId(project.id)}
-              onDoubleClick={() => void openProject()}
-              onContextMenu={(event) => {
-                event.preventDefault();
-                openActionsModal(project);
-              }}
-            >
-              <span>{index + 1}</span>
-              <strong>{project.name}{project.exists === false ? "（项目文件未找到）" : ""}</strong>
-              <span>{formatTime(project.updatedAt)}</span>
-              <span>{formatTime(project.createdAt)}</span>
-            </button>
-          ))}
-        </section>
-        <button className="enter-project-button" onClick={() => void openProject()} disabled={!selectedProject || isBusy}>
-          进入
-        </button>
-      </div>
-    );
-  }
-
-  function renderHub() {
-    if (!currentProject) return null;
-    return (
-      <div className="mastps-app hub-screen">
-        <div className="ambient-layer" />
-        {renderStatus()}
-        {renderModal()}
-        <button className="back-button" onClick={() => setView("projects")}>
-          ← 项目
-        </button>
-        <section className="hub-card">
-          <span className="hero-eyebrow">写作中心</span>
-          <h1>{currentProject.name}</h1>
-          <div className="hub-actions">
-            <button className="hub-action-card" onClick={() => void enterWriter()}>
-              <span>✍</span>
-              <strong>写作</strong>
-              <small>进入项目文档目录与正文编辑区</small>
-            </button>
-            <button className="hub-action-card" onClick={() => setView("outline")}>
-              <span>🧭</span>
-              <strong>大纲</strong>
-              <small>进入大纲模块，管理剧情结构与大纲草稿</small>
-            </button>
-            <button className="hub-action-card" onClick={() => setModalMode("preferences")}>
-              <span>⚙</span>
-              <strong>首选项</strong>
-              <small>配置编辑按钮与写作界面</small>
-            </button>
-          </div>
-        </section>
-      </div>
-    );
-  }
-
-  function renderOutlineModule() {
-    if (!currentProject) return null;
-    return (
-      <div className="mastps-app hub-screen outline-module-screen">
-        <div className="ambient-layer" />
-        {renderStatus()}
-        {renderModal()}
-        <button className="back-button" onClick={() => setView("hub")}>
-          ← 写作中心
-        </button>
-        <section className="hub-card outline-module-card">
-          <span className="hero-eyebrow">大纲模块</span>
-          <h1>{currentProject.name}</h1>
-          <p className="hub-intro">这里用于存放与正文分离的大纲资料。进入“自由写作”后，会打开一个与正文写作界面相同的专属编辑器，但内容会保存到大纲库中。</p>
-          <div className="hub-actions">
-            <button className="hub-action-card primary-module-card" onClick={() => void enterOutlineFreeWriting()}>
-              <span>📝</span>
-              <strong>自由写作</strong>
-              <small>使用完整编辑器自由记录主线、支线、章节梗概、人物动机和伏笔。</small>
-            </button>
-          </div>
-        </section>
-      </div>
-    );
-  }
-
-  function renderLeftSidebar() {
-    if (!currentProject || !leftSidebarOpen) return null;
-    return (
-      <aside className="left-sidebar">
-        <div className="sidebar-title">
-          <span className="app-mark">▯</span>
-          <strong>{currentProject.name}</strong>
-          <button onClick={() => setLeftSidebarOpen(false)} title="隐藏侧边栏">
-            ˅
-          </button>
-        </div>
-        <div className="sidebar-section">
-          <p>项目设定</p>
-          <button>♙ 人物档案</button>
-          <button>□ 世界观设定</button>
-          <button className={workspaceMode === "outline" ? "is-section-active" : ""}>✒ 大纲与时间线</button>
-        </div>
-        <div className="sidebar-section grow-section">
-          <div className="section-heading">
-            <p>{workspaceLabels.listTitle}</p>
-            <button onClick={openCreateDocumentModal}>+</button>
-          </div>
-          <div className="volume-row">⌄ ▰ {workspaceLabels.volume}</div>
-          <div className="document-list">
-            {documents.map((doc) => (
-              <button
-                key={doc.id}
-                className={`document-item ${doc.id === activeDocumentId ? "is-active" : ""}`}
-                onClick={() => void selectDocument(doc)}
-                onContextMenu={(event) => {
-                  event.preventDefault();
-                  openRenameDocumentModal(doc);
-                }}
-              >
-                <span>▤</span>
-                <span>{doc.title}</span>
-                {doc.id !== "main" ? (
-                  <span
-                    className="document-delete"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void deleteDocument(doc);
-                    }}
-                    title="删除文档"
-                  >
-                    ×
-                  </span>
-                ) : null}
-              </button>
-            ))}
-            {documents.length === 0 ? <p className="empty-documents">{workspaceLabels.empty}，点击 + 新建。</p> : null}
-          </div>
-        </div>
-        <button className="settings-entry" onClick={() => setModalMode("preferences")}>
-          ⚙ 软件设置
-        </button>
-      </aside>
-    );
-  }
-
-  function renderAiPanel() {
-    if (!aiPanelOpen) return null;
-    return (
-      <aside className="ai-sidebar">
-        <div className="ai-tabs">
-          <button className="is-active">✨ AI 助手</button>
-          <button>▤ 参考设定</button>
-        </div>
-        <div className="ai-scroll">
-          <div className="ai-card">
-            <h3>✨ 剧情推演（本地 Ollama）</h3>
-            <p>根据设定，主角在这里醒来后，遇到巡逻兵的概率很高。建议让他先发现遗留的终端机，获取部分背景信息，然后再展开冲突。需要我帮你生成一段环境描写的扩写吗？</p>
-            <div className="ai-card-actions">
-              <button>扩写环境</button>
-              <button>生成巡逻兵设定</button>
+      <div className="binder-node-block" key={node.id}>
+        <div className={`binder-node-row ${active ? "active" : ""}`} style={{ paddingLeft: `${depth * 14 + 4}px` }}>
+          <button className="disclosure" onClick={() => hasChildren && toggleExpanded(collection, node.id)}>{hasChildren ? (expandedNode ? "⌄" : "›") : ""}</button>
+          <button className="binder-icon" onClick={() => openEditNodeModal(collection, node)} title="修改图标">{node.icon}</button>
+          <button className="binder-title" onClick={() => void selectBinderNode(collection, node)}>{node.title}</button>
+          <button className="mini-action" onClick={() => openCreateNodeModal(collection, node.id)} title="添加子文稿">＋</button>
+          <button className="mini-action" onClick={() => setOpenBinderMenu(openBinderMenu === key ? "" : key)} title="更多">…</button>
+          {openBinderMenu === key ? (
+            <div className="binder-context-menu">
+              <button onClick={() => openCreateNodeModal(collection, node.id)}>添加子文稿</button>
+              <button onClick={() => openEditNodeModal(collection, node)}>重命名 / 图标</button>
+              <button className="danger" onClick={() => void deleteBinderNode(collection, node)}>删除文稿</button>
             </div>
-          </div>
-          <div className="chapter-memo">
-            <h3>本章目标备忘</h3>
-            <ul>
-              <li>交代末日背景</li>
-              <li>主角发现自己失忆</li>
-              <li>埋下手臂受伤的伏笔</li>
-            </ul>
-          </div>
+          ) : null}
         </div>
-        <div className="ai-input-row">
-          <input placeholder="询问 AI 关于剧情的建议…" disabled />
-          <button disabled>↵</button>
+        {hasChildren && expandedNode ? (
+          <div>{node.children.map((child) => renderBinderNode(collection, child, depth + 1))}</div>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderSidebar() {
+    if (!leftSidebarOpen) return null;
+    return (
+      <aside className="sidebar">
+        <div className="project-switcher">
+          <div className="project-name"><span className="orange-mark">▯</span>{currentProject?.name ?? "未打开项目"}</div>
+          <button onClick={() => setView("projects")} title="返回项目列表">⌄</button>
+        </div>
+
+        <div className="sidebar-scroll">
+          <section className="nav-section">
+            <div className="section-title">项目设定</div>
+            <button className="nav-item"><span>♙</span>人物档案</button>
+            <button className="nav-item"><span>□</span>世界观设定</button>
+            <button className="nav-item"><span>⌁</span>大纲与时间线</button>
+          </section>
+
+          <section className="nav-section">
+            <div className="section-title with-action"><span>写作中心</span></div>
+            {renderBinderRoot("draft")}
+            {renderBinderRoot("outline")}
+          </section>
+        </div>
+
+        <div className="sidebar-footer">
+          <button className="settings-entry" onClick={() => setModalMode("preferences")}>⚙ 软件设置</button>
         </div>
       </aside>
     );
   }
 
   function renderWriter() {
-    if (!currentProject) return null;
     return (
-      <div className="mastps-app writer-screen">
-        <div className="ambient-layer" />
-        {renderStatus()}
-        {renderModal()}
-        {renderLeftSidebar()}
-        <section className="writer-workspace">
-          <header className="window-bar">
-            <strong>{workspaceMode === "outline" ? "Mastps Outline" : "Mastps Editor UI"}</strong>
-            <div className="window-actions">
-              <button onClick={() => editor?.chain().focus().undo().run()} title="撤销">
-                ↶
-              </button>
-              <button onClick={() => editor?.chain().focus().redo().run()} title="重做">
-                ↷
-              </button>
-              <button onClick={closeEditorToParent} title="关闭编辑器">
-                ×
-              </button>
-            </div>
-          </header>
+      <div className="app-shell">
+        <div className="ambient ambient-left" />
+        <div className="ambient ambient-right" />
+        {renderSidebar()}
+        <main className="writer-pane">
+          <div className="app-titlebar">
+            <strong>Mastps Editor UI</strong>
+            <div className="window-actions"><button>↶</button><button>↷</button><button>×</button></div>
+          </div>
           {renderEditorToolbar()}
-          <main className="editor-canvas">
-            {renderBubbleMenu()}
-            {renderSlashMenu()}
-            {activeDocumentId ? (
-              <EditorContent editor={editor} />
+          <div className="writing-surface">
+            {activeNode ? (
+              <div className="page-wrap">
+                <div className="document-kicker">{activeRoot.icon} {activeRoot.title}</div>
+                <input
+                  className="document-title-input"
+                  value={activeNode.title}
+                  readOnly
+                  title="标题请在左侧栏通过“重命名 / 图标”修改"
+                />
+                {editor ? (
+                  <BubbleMenu editor={editor} tippyOptions={{ duration: 120 }}>
+                    <div className="bubble-menu">
+                      <button onClick={() => editor.chain().focus().toggleBold().run()}>B</button>
+                      <button onClick={() => editor.chain().focus().toggleItalic().run()}>I</button>
+                      <button onClick={openLinkModal}>链接</button>
+                    </div>
+                  </BubbleMenu>
+                ) : null}
+                <EditorContent editor={editor} />
+                {slashMenuOpen ? (
+                  <div className="slash-menu">
+                    <button onClick={() => applySlashCommand("heading1")}>H1 一级标题</button>
+                    <button onClick={() => applySlashCommand("heading2")}>H2 二级标题</button>
+                    <button onClick={() => applySlashCommand("bullet")}>• 无序列表</button>
+                    <button onClick={() => applySlashCommand("task")}>☑ 任务清单</button>
+                    <button onClick={() => applySlashCommand("quote")}>“ 引用</button>
+                    <button onClick={() => applySlashCommand("table")}>▦ 表格</button>
+                  </div>
+                ) : null}
+              </div>
             ) : (
-              <div className="empty-editor">
-                <h2>{workspaceLabels.empty}</h2>
-                <p>{workspaceMode === "outline" ? "从左侧新建一个大纲后即可开始整理结构。" : "从左侧新建一个正文文档后即可开始写作。"}</p>
-                <button className="primary-button" onClick={openCreateDocumentModal}>
-                  {workspaceLabels.createButton}
-                </button>
+              <div className="empty-editor-state">
+                <div className="empty-icon">{activeRoot.icon}</div>
+                <h2>{activeRoot.title}</h2>
+                <p>{activeCollection === "draft" ? "这里是 Scrivener 式草稿根目录，可以无限添加子文稿。" : "这里是大纲模块，默认包含自由写作，也可以继续添加子大纲。"}</p>
+                <button className="primary" onClick={() => openCreateNodeModal(activeCollection, activeRoot.id)}>添加文稿</button>
               </div>
             )}
-          </main>
-        </section>
-        {renderAiPanel()}
+          </div>
+        </main>
+        {aiPanelOpen ? renderAiPanel() : null}
+        {statusMessage ? <div className="toast">{statusMessage}</div> : null}
+        {renderModal()}
+      </div>
+    );
+  }
+
+  function renderAiPanel() {
+    return (
+      <aside className="ai-panel">
+        <div className="ai-tabs">
+          <button className="active">✦ AI 助手</button>
+          <button>▧ 参考设定</button>
+        </div>
+        <div className="ai-body">
+          <div className="ai-card">
+            <div className="ai-card-title">✦ 剧情推演</div>
+            <p>这里暂时只显示 AI 侧边栏，不接入实际功能。后续可以在这里扩写、总结、检查设定一致性。</p>
+            <div className="ai-actions"><button>扩写环境</button><button>生成设定</button></div>
+          </div>
+          <div className="note-card">
+            <strong>当前上下文</strong>
+            <ul>
+              <li>模块：{activeRoot.title}</li>
+              <li>文稿：{activeNode?.title ?? "未选择"}</li>
+              <li>层级树：{countNodes(activeRoot.children)} 个文稿</li>
+            </ul>
+          </div>
+        </div>
+        <div className="ai-input"><input placeholder="询问 AI 关于剧情的建议…" /><button>↵</button></div>
+      </aside>
+    );
+  }
+
+  function renderProjectsScreen() {
+    return (
+      <div className="project-screen">
+        <div className="ambient ambient-left" />
+        <div className="ambient ambient-right" />
+        <div className="project-card hero-card">
+          <div>
+            <div className="brand-label">MASTERPIECES</div>
+            <h1>选择项目</h1>
+          </div>
+          <div className="hero-actions">
+            <button className="secondary" onClick={openImportProjectModal}>打开已有项目</button>
+            <button className="square-primary" onClick={openCreateProjectModal}>＋</button>
+          </div>
+        </div>
+        <div className="project-card table-card">
+          <div className="project-table-head"><span>序号</span><span>项目名称</span><span>最后修改时间</span><span>创建时间</span><span></span></div>
+          <div className="project-table-body">
+            {projects.length === 0 ? <div className="empty-projects">还没有最近项目。点击右上角“＋”创建一个。</div> : null}
+            {projects.map((project, index) => (
+              <button
+                key={project.id}
+                className={`project-row ${selectedProjectId === project.id ? "selected" : ""} ${project.exists === false ? "missing" : ""}`}
+                onClick={() => setSelectedProjectId(project.id)}
+                onDoubleClick={() => void openProject()}
+              >
+                <span>{index + 1}</span>
+                <strong>{project.name}</strong>
+                <span>{formatTime(project.updatedAt)}</span>
+                <span>{formatTime(project.createdAt)}</span>
+                <span className="row-actions" onClick={(event) => event.stopPropagation()}>
+                  <button onClick={() => openProjectActionsModal(project)}>…</button>
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <button className="enter-button" disabled={!selectedProject || isBusy} onClick={() => void openProject()}>进入</button>
+        {statusMessage ? <div className="toast">{statusMessage}</div> : null}
+        {renderModal()}
+      </div>
+    );
+  }
+
+  function renderModal() {
+    if (!modalMode) return null;
+    const allItems = toolbarItems();
+    return (
+      <div className="modal-backdrop" onMouseDown={closeModal}>
+        <div className="modal" onMouseDown={(event) => event.stopPropagation()}>
+          {modalMode === "createProject" ? (
+            <>
+              <h2>创建项目</h2>
+              <label>项目名称<input value={projectNameInput} onChange={(event) => setProjectNameInput(event.currentTarget.value)} placeholder="我的小说" autoFocus /></label>
+              <label>存档文件夹<div className="path-row"><input value={pathInput} onChange={(event) => setPathInput(event.currentTarget.value)} placeholder="/Users/you/Documents" /><button onClick={() => void chooseFolderForInput("create")}>选择…</button></div></label>
+              <div className="modal-actions"><button onClick={closeModal}>取消</button><button className="primary" onClick={() => void createProject()} disabled={isBusy}>创建</button></div>
+            </>
+          ) : null}
+
+          {modalMode === "importProject" ? (
+            <>
+              <h2>打开已有项目</h2>
+              <label>项目文件夹<div className="path-row"><input value={pathInput} onChange={(event) => setPathInput(event.currentTarget.value)} placeholder="选择 .masterpiece 文件夹" autoFocus /><button onClick={() => void chooseFolderForInput("project")}>选择…</button></div></label>
+              <div className="modal-actions"><button onClick={closeModal}>取消</button><button className="primary" onClick={() => void importExistingProject()} disabled={isBusy}>打开</button></div>
+            </>
+          ) : null}
+
+          {modalMode === "renameProject" ? (
+            <>
+              <h2>重命名项目</h2>
+              <label>项目名称<input value={projectNameInput} onChange={(event) => setProjectNameInput(event.currentTarget.value)} autoFocus /></label>
+              <div className="modal-actions"><button onClick={closeModal}>取消</button><button className="primary" onClick={() => void renameProject()} disabled={isBusy}>保存</button></div>
+            </>
+          ) : null}
+
+          {modalMode === "relocateProject" ? (
+            <>
+              <h2>重新定位项目</h2>
+              <label>项目文件夹<div className="path-row"><input value={pathInput} onChange={(event) => setPathInput(event.currentTarget.value)} autoFocus /><button onClick={() => void chooseFolderForInput("project")}>选择…</button></div></label>
+              <div className="modal-actions"><button onClick={closeModal}>取消</button><button className="primary" onClick={() => void relocateProject()} disabled={isBusy}>保存</button></div>
+            </>
+          ) : null}
+
+          {modalMode === "projectActions" && modalProject ? (
+            <>
+              <h2>{modalProject.name}</h2>
+              <p className="muted path-text">{modalProject.path}</p>
+              <div className="action-list">
+                <button onClick={() => openRenameProjectModal(modalProject)}>重命名项目</button>
+                <button onClick={() => openRelocateProjectModal(modalProject)}>重新定位</button>
+                <button className="danger" onClick={() => removeFromRecent(modalProject)}>从最近列表移除</button>
+              </div>
+              <div className="modal-actions"><button onClick={closeModal}>关闭</button></div>
+            </>
+          ) : null}
+
+          {modalMode === "createNode" ? (
+            <>
+              <h2>添加文稿</h2>
+              <label>标题<input value={nodeTitleInput} onChange={(event) => setNodeTitleInput(event.currentTarget.value)} autoFocus /></label>
+              <label>标题图标<input value={nodeIconInput} onChange={(event) => setNodeIconInput(event.currentTarget.value)} placeholder="可输入 emoji、单字或符号" /></label>
+              <p className="muted small">文稿可以继续添加子文稿，层级数量不限制。</p>
+              <div className="modal-actions"><button onClick={closeModal}>取消</button><button className="primary" onClick={() => void createBinderNode()} disabled={isBusy}>添加</button></div>
+            </>
+          ) : null}
+
+          {modalMode === "editNode" ? (
+            <>
+              <h2>标题与图标</h2>
+              <label>标题<input value={nodeTitleInput} onChange={(event) => setNodeTitleInput(event.currentTarget.value)} autoFocus /></label>
+              <label>标题图标<input value={nodeIconInput} onChange={(event) => setNodeIconInput(event.currentTarget.value)} placeholder="例如 📄、🧭、🌙、人物" /></label>
+              <div className="modal-actions"><button onClick={closeModal}>取消</button><button className="primary" onClick={() => void saveBinderItemEdit()} disabled={isBusy}>保存</button></div>
+            </>
+          ) : null}
+
+          {modalMode === "insertLink" ? (
+            <>
+              <h2>插入链接</h2>
+              <label>地址<input value={linkUrlInput} onChange={(event) => setLinkUrlInput(event.currentTarget.value)} placeholder="https://" autoFocus /></label>
+              <div className="modal-actions"><button onClick={closeModal}>取消</button><button className="primary" onClick={applyLink}>应用</button></div>
+            </>
+          ) : null}
+
+          {modalMode === "insertImage" ? (
+            <>
+              <h2>插入图片</h2>
+              <label>图片地址<input value={imageUrlInput} onChange={(event) => setImageUrlInput(event.currentTarget.value)} placeholder="https:// 或 base64" autoFocus /></label>
+              <div className="modal-actions"><button onClick={closeModal}>取消</button><button className="primary" onClick={applyImage}>插入</button></div>
+            </>
+          ) : null}
+
+          {modalMode === "preferences" ? (
+            <>
+              <h2>首选项</h2>
+              <p className="muted">选择哪些编辑按钮显示在主工具栏；未勾选的按钮会进入“…”菜单。</p>
+              <div className="prefs-list">
+                {Object.entries(TOOLBAR_GROUP_LABELS).map(([group, label]) => {
+                  const items = allItems.filter((item) => item.group === group);
+                  return (
+                    <div key={group} className="prefs-group">
+                      <h3>{label}</h3>
+                      <div className="prefs-grid">
+                        {items.map((item) => (
+                          <label key={item.id} className="check-row">
+                            <input type="checkbox" checked={visibleToolbarIds.includes(item.id)} onChange={() => toggleToolbarPreference(item.id)} />
+                            <span>{item.icon}</span>
+                            <strong>{item.title}</strong>
+                          </label>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="modal-actions"><button onClick={() => setVisibleToolbarIds(DEFAULT_VISIBLE_TOOLBAR_IDS)}>恢复默认</button><button className="primary" onClick={closeModal}>完成</button></div>
+            </>
+          ) : null}
+        </div>
       </div>
     );
   }
 
   if (view === "splash") {
-    return (
-      <div className="mastps-app splash-screen">
-        <div className="ambient-layer" />
-        <h1>MasterPieces</h1>
-      </div>
-    );
+    return <div className="splash"><div className="splash-logo">MasterPieces</div><div className="splash-subtitle">长篇叙事工程系统</div></div>;
   }
 
-  if (view === "hub") return renderHub();
-  if (view === "outline") return renderOutlineModule();
-  if (view === "writer" || view === "outlineWriter") return renderWriter();
-  return renderProjectList();
+  if (view === "projects") return renderProjectsScreen();
+  return renderWriter();
 }
-
-export default App;
