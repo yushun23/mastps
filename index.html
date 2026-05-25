@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
@@ -8,20 +8,6 @@
   </head>
   <body>
     <div id="root"></div>
-    <!-- 调试标记：确认 HTML 已加载 -->
-    <div id="load-indicator" style="position:fixed;top:0;left:0;right:0;background:#22c55e;color:#fff;text-align:center;font:14px sans-serif;z-index:99999;padding:4px;">[MASTPS] HTML loaded</div>
-    <script>
-      // 全局错误捕获
-      window.onerror = function(msg, url, line, col, err) {
-        var el = document.getElementById('load-indicator');
-        if (el) { el.style.background = '#ef4444'; el.textContent = '[MASTPS] JS ERROR: ' + msg + ' @ ' + url + ':' + line; }
-      };
-      window.addEventListener('unhandledrejection', function(e) {
-        var el = document.getElementById('load-indicator');
-        if (el) { el.style.background = '#ef4444'; el.textContent = '[MASTPS] PROMISE REJECTION: ' + (e.reason && e.reason.message || e.reason); }
-      });
-      console.log('[MASTPS] index.html script block executed');
-    </script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
