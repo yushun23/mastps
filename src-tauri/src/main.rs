@@ -1,11 +1,14 @@
 use chrono::Utc;
+use tauri_plugin_dialog::DialogExt;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
+    env,
+    fs::{self, File},
+    io::{self, Seek, Write},
     path::{Path, PathBuf},
-    process::Command,
 };
 use uuid::Uuid;
+use zip::{write::FileOptions, CompressionMethod, ZipWriter};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +64,86 @@ struct BinderRoot {
 struct BinderState {
     draft: BinderRoot,
     outline: BinderRoot,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ResourceRecord {
+    id: String,
+    kind: String,
+    title: String,
+    subtitle: String,
+    group: String,
+    status: String,
+    tags: Vec<String>,
+    body: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BinderTrashDocument {
+    id: String,
+    title: String,
+    html: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BinderTrashItem {
+    id: String,
+    collection: String,
+    node: BinderNode,
+    documents: Vec<BinderTrashDocument>,
+    deleted_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BinderTrashMoveResult {
+    binder: BinderState,
+    trash_item: BinderTrashItem,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct StructureChapterRecord {
+    id: String,
+    title: String,
+    parent_id: String,
+    order: i64,
+    notes: String,
+    target_words: i64,
+    collapsed: bool,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct OutlineSceneRecord {
+    id: String,
+    title: String,
+    chapter_id: Option<String>,
+    chapter: String,
+    scene_no: String,
+    status: String,
+    pov: String,
+    location: String,
+    timeline: String,
+    characters: Vec<String>,
+    items: Vec<String>,
+    tags: Vec<String>,
+    goal: String,
+    conflict: String,
+    outcome: String,
+    summary: String,
+    notes: String,
+    target_words: i64,
+    current_words: i64,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -131,6 +214,10 @@ fn collection_document_path(project_path: &str, kind: CollectionKind, document_i
 
 fn binder_document_path(project_path: &str, document_id: &str) -> PathBuf {
     binder_documents_dir(project_path).join(format!("{}.html", document_id))
+}
+
+fn binder_trash_item_dir(project_path: &str, trash_id: &str) -> PathBuf {
+    Path::new(project_path).join(".trash").join("binder_documents").join(clean_component(trash_id))
 }
 
 fn read_manifest_from(path: &str) -> Result<ProjectManifest, String> {
@@ -426,39 +513,69 @@ fn remove_node(nodes: &mut Vec<BinderNode>, document_id: &str, removed_ids: &mut
     false
 }
 
-#[tauri::command]
-fn choose_folder(prompt: Option<String>) -> Result<Option<String>, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let message = prompt.unwrap_or_else(|| "请选择文件夹".to_string()).replace('"', "'");
-        let script = format!("POSIX path of (choose folder with prompt \"{}\")", message);
-        let output = Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .output()
-            .map_err(|e| format!("无法打开文件夹选择器：{}", e))?;
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if path.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(path.trim_end_matches('/').to_string()))
-            }
-        } else {
-            let err = String::from_utf8_lossy(&output.stderr).to_string();
-            if err.contains("User canceled") || err.contains("-128") {
-                Ok(None)
-            } else {
-                Err(format!("选择文件夹失败：{}", err.trim()))
-            }
+fn take_node(nodes: &mut Vec<BinderNode>, document_id: &str) -> Option<BinderNode> {
+    if let Some(position) = nodes.iter().position(|node| node.id == document_id) {
+        return Some(nodes.remove(position));
+    }
+    for node in nodes.iter_mut() {
+        if let Some(found) = take_node(&mut node.children, document_id) {
+            node.updated_at = now();
+            return Some(found);
         }
     }
+    None
+}
 
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = prompt;
-        Err("当前补丁的文件夹选择器只针对 macOS。".to_string())
+fn node_exists(nodes: &[BinderNode], document_id: &str) -> bool {
+    nodes.iter().any(|node| node.id == document_id || node_exists(&node.children, document_id))
+}
+
+fn insert_node_under(nodes: &mut Vec<BinderNode>, parent_id: &str, child: BinderNode) -> bool {
+    for node in nodes.iter_mut() {
+        if node.id == parent_id {
+            node.children.push(child);
+            node.updated_at = now();
+            return true;
+        }
+        if insert_node_under(&mut node.children, parent_id, child.clone()) {
+            node.updated_at = now();
+            return true;
+        }
     }
+    false
+}
+
+fn safe_move_or_copy(from: &Path, to: &Path) -> Result<(), String> {
+    if let Some(parent) = to.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("无法创建目录 {}：{}", parent.display(), e))?;
+    }
+    if !from.exists() {
+        fs::write(to, "").map_err(|e| format!("无法创建空文稿 {}：{}", to.display(), e))?;
+        return Ok(());
+    }
+    match fs::rename(from, to) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            fs::copy(from, to).map_err(|e| format!("无法复制文稿到回收站 {}：{}", to.display(), e))?;
+            fs::remove_file(from).map_err(|e| format!("无法删除原文稿 {}：{}", from.display(), e))?;
+            Ok(())
+        }
+    }
+}
+
+#[tauri::command]
+async fn choose_folder(
+    app: tauri::AppHandle,
+    prompt: Option<String>,
+) -> Result<Option<String>, String> {
+    let title = prompt.unwrap_or_else(|| "请选择文件夹".to_string());
+    let folder = app
+        .dialog()
+        .file()
+        .set_title(title)
+        .blocking_pick_folder();
+
+    Ok(folder.map(|path| path.to_string()))
 }
 
 #[tauri::command]
@@ -677,6 +794,118 @@ fn rename_binder_document(
     Ok(state)
 }
 
+
+#[tauri::command]
+fn move_binder_document_to_trash(path: String, collection: String, document_id: String) -> Result<BinderTrashMoveResult, String> {
+    let _ = CollectionKind::from_binder_collection(&collection)?;
+    let mut state = read_binder_state(&path)?;
+    let root = root_mut(&mut state, &collection)?;
+    let node = take_node(&mut root.children, &document_id).ok_or_else(|| "未找到该文稿".to_string())?;
+    let trash_id = Uuid::new_v4().to_string();
+    let trash_dir = binder_trash_item_dir(&path, &trash_id);
+    fs::create_dir_all(&trash_dir).map_err(|e| format!("无法创建回收站目录 {}：{}", trash_dir.display(), e))?;
+
+    let mut ids = Vec::new();
+    collect_node_ids(&node, &mut ids);
+    let documents = ids.iter().map(|id| {
+        let title = find_binder_node_title(&node, id).unwrap_or_else(|| "文稿".to_string());
+        BinderTrashDocument { id: id.clone(), title, html: String::new() }
+    }).collect::<Vec<_>>();
+
+    for id in &ids {
+        let from = binder_document_path(&path, id);
+        let to = trash_dir.join(format!("{}.html", id));
+        safe_move_or_copy(&from, &to)?;
+    }
+
+    write_binder_state(&path, &state)?;
+    let _ = touch_manifest(&path);
+
+    Ok(BinderTrashMoveResult {
+        binder: state,
+        trash_item: BinderTrashItem {
+            id: trash_id,
+            collection,
+            node,
+            documents,
+            deleted_at: now(),
+        },
+    })
+}
+
+fn find_binder_node_title(node: &BinderNode, document_id: &str) -> Option<String> {
+    if node.id == document_id {
+        return Some(node.title.clone());
+    }
+    for child in &node.children {
+        if let Some(title) = find_binder_node_title(child, document_id) {
+            return Some(title);
+        }
+    }
+    None
+}
+
+#[tauri::command]
+fn restore_binder_document_from_trash(
+    path: String,
+    collection: String,
+    trash_id: String,
+    node: BinderNode,
+    parent_id: Option<String>,
+) -> Result<BinderState, String> {
+    let _ = CollectionKind::from_binder_collection(&collection)?;
+    let mut state = read_binder_state(&path)?;
+    let root = root_mut(&mut state, &collection)?;
+    let mut ids = Vec::new();
+    collect_node_ids(&node, &mut ids);
+    for id in &ids {
+        if node_exists(&root.children, id) {
+            return Err("当前项目中存在相同文稿 ID，无法安全还原。".to_string());
+        }
+    }
+
+    let trash_dir = binder_trash_item_dir(&path, &trash_id);
+    for id in &ids {
+        let from = trash_dir.join(format!("{}.html", id));
+        let to = binder_document_path(&path, id);
+        safe_move_or_copy(&from, &to)?;
+    }
+
+    match parent_id.as_deref() {
+        Some(id) if !id.trim().is_empty() && id != root.id => {
+            if !insert_node_under(&mut root.children, id, node) {
+                return Err("未找到还原目标父文稿。".to_string());
+            }
+        }
+        _ => root.children.push(node),
+    }
+
+    let _ = fs::remove_dir_all(&trash_dir);
+    write_binder_state(&path, &state)?;
+    let _ = touch_manifest(&path);
+    Ok(state)
+}
+
+#[tauri::command]
+fn purge_binder_trash_item(path: String, trash_id: String) -> Result<(), String> {
+    let trash_dir = binder_trash_item_dir(&path, &trash_id);
+    if trash_dir.exists() {
+        fs::remove_dir_all(&trash_dir).map_err(|e| format!("无法清除回收站项目 {}：{}", trash_dir.display(), e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn purge_binder_trash_items(path: String, trash_ids: Vec<String>) -> Result<(), String> {
+    for trash_id in trash_ids {
+        let trash_dir = binder_trash_item_dir(&path, &trash_id);
+        if trash_dir.exists() {
+            let _ = fs::remove_dir_all(&trash_dir);
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn delete_binder_document(path: String, collection: String, document_id: String) -> Result<BinderState, String> {
     let mut state = read_binder_state(&path)?;
@@ -721,8 +950,564 @@ fn save_binder_document(path: String, document_id: String, content: String) -> R
     touch_manifest(&path)
 }
 
+fn desktop_dir() -> Result<PathBuf, String> {
+    let candidates = [
+        env::var("USERPROFILE").ok().map(|home| PathBuf::from(home).join("Desktop")),
+        env::var("HOME").ok().map(|home| PathBuf::from(home).join("Desktop")),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.exists() || fs::create_dir_all(&candidate).is_ok() {
+            return Ok(candidate);
+        }
+    }
+
+    Err("无法定位桌面路径。请确认系统存在 Desktop 文件夹。".to_string())
+}
+
+fn clean_font_file_stem(stem: &str) -> Option<String> {
+    let base = stem
+        .replace('_', " ")
+        .replace('-', " ")
+        .replace("Bold", "")
+        .replace("Italic", "")
+        .replace("Regular", "")
+        .replace("Light", "")
+        .replace("Medium", "")
+        .replace("Semibold", "")
+        .replace("SemiBold", "")
+        .replace("Oblique", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let cleaned = base.trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+fn collect_font_names_from_dir(dir: &Path, fonts: &mut Vec<String>, depth: usize) {
+    if depth > 4 || !dir.exists() {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_font_names_from_dir(&path, fonts, depth + 1);
+            continue;
+        }
+        let Some(extension) = path.extension().and_then(|value| value.to_str()).map(|value| value.to_lowercase()) else {
+            continue;
+        };
+        if !matches!(extension.as_str(), "ttf" | "otf" | "ttc") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|value| value.to_str()).and_then(clean_font_file_stem) {
+            fonts.push(stem);
+        }
+    }
+}
+
+#[tauri::command]
+fn list_system_fonts() -> Result<Vec<String>, String> {
+    let mut fonts = vec![
+        "宋体".to_string(),
+        "微软雅黑".to_string(),
+        "黑体".to_string(),
+        "楷体".to_string(),
+        "仿宋".to_string(),
+        "SimSun".to_string(),
+        "Microsoft YaHei".to_string(),
+        "Arial".to_string(),
+        "Times New Roman".to_string(),
+        "Georgia".to_string(),
+        "serif".to_string(),
+        "sans-serif".to_string(),
+    ];
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(windir) = env::var("WINDIR") {
+        candidates.push(PathBuf::from(windir).join("Fonts"));
+    }
+    candidates.push(PathBuf::from("C:\\Windows\\Fonts"));
+    candidates.push(PathBuf::from("/System/Library/Fonts"));
+    candidates.push(PathBuf::from("/Library/Fonts"));
+    candidates.push(PathBuf::from("/usr/share/fonts"));
+    candidates.push(PathBuf::from("/usr/local/share/fonts"));
+    if let Ok(home) = env::var("HOME") {
+        candidates.push(PathBuf::from(&home).join("Library/Fonts"));
+        candidates.push(PathBuf::from(&home).join(".fonts"));
+        candidates.push(PathBuf::from(&home).join(".local/share/fonts"));
+    }
+
+    for dir in candidates {
+        collect_font_names_from_dir(&dir, &mut fonts, 0);
+    }
+
+    fonts.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    fonts.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+    Ok(fonts)
+}
+
+fn markdown_filename(index: usize, title: &str, fallback_id: &str) -> String {
+    let clean = clean_component(title);
+    let stem = if clean.trim().is_empty() {
+        format!("未命名-{}", fallback_id.chars().take(8).collect::<String>())
+    } else {
+        clean
+    };
+    format!("{:03}-{}.md", index, stem)
+}
+
+fn decode_html_entities(value: String) -> String {
+    value
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&apos;", "'")
+}
+
+fn normalize_markdown(value: String) -> String {
+    let mut lines = Vec::new();
+    let mut blank_count = 0;
+    for line in value.lines() {
+        let cleaned = line.trim_end();
+        if cleaned.trim().is_empty() {
+            blank_count += 1;
+            if blank_count <= 1 {
+                lines.push(String::new());
+            }
+        } else {
+            blank_count = 0;
+            lines.push(cleaned.to_string());
+        }
+    }
+    lines.join("\n").trim().to_string()
+}
+
+fn html_to_markdown(html: &str) -> String {
+    let mut output = String::new();
+    let mut chars = html.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '<' {
+            let mut raw_tag = String::new();
+            while let Some(tag_ch) = chars.next() {
+                if tag_ch == '>' {
+                    break;
+                }
+                raw_tag.push(tag_ch);
+            }
+
+            let trimmed = raw_tag.trim().to_lowercase();
+            let is_close = trimmed.starts_with('/');
+            let tag_name = trimmed
+                .trim_start_matches('/')
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('/');
+
+            match (tag_name, is_close) {
+                ("br", _) => output.push('\n'),
+                ("h1", false) => output.push_str("\n# "),
+                ("h2", false) => output.push_str("\n## "),
+                ("h3", false) => output.push_str("\n### "),
+                ("h4", false) => output.push_str("\n#### "),
+                ("h5", false) => output.push_str("\n##### "),
+                ("h6", false) => output.push_str("\n###### "),
+                ("li", false) => output.push_str("\n- "),
+                ("blockquote", false) => output.push_str("\n> "),
+                ("td", false) | ("th", false) => output.push_str(" | "),
+                ("p", true)
+                | ("div", true)
+                | ("section", true)
+                | ("article", true)
+                | ("h1", true)
+                | ("h2", true)
+                | ("h3", true)
+                | ("h4", true)
+                | ("h5", true)
+                | ("h6", true)
+                | ("li", true)
+                | ("blockquote", true)
+                | ("tr", true) => output.push_str("\n\n"),
+                _ => {}
+            }
+        } else {
+            output.push(ch);
+        }
+    }
+
+    normalize_markdown(decode_html_entities(output))
+}
+
+fn write_md_file(file: &Path, content: &str) -> Result<(), String> {
+    if let Some(parent) = file.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("无法创建导出目录 {}：{}", parent.display(), e))?;
+    }
+    fs::write(file, content).map_err(|e| format!("无法写入 Markdown 文件 {}：{}", file.display(), e))
+}
+
+fn export_binder_nodes(
+    project_path: &str,
+    nodes: &[BinderNode],
+    output_dir: &Path,
+    trail: &[String],
+    index: &mut usize,
+) -> Result<(), String> {
+    fs::create_dir_all(output_dir).map_err(|e| format!("无法创建导出目录 {}：{}", output_dir.display(), e))?;
+
+    for node in nodes {
+        *index += 1;
+        let mut current_trail = trail.to_vec();
+        current_trail.push(node.title.clone());
+        let file = output_dir.join(markdown_filename(*index, &node.title, &node.id));
+        let html = read_binder_document(project_path.to_string(), node.id.clone())?;
+        let body = html_to_markdown(&html);
+        let content = format!(
+            "# {}\n\n> 路径：{}\n> 创建时间：{}\n> 更新时间：{}\n\n{}\n",
+            node.title,
+            current_trail.join(" / "),
+            node.created_at,
+            node.updated_at,
+            if body.is_empty() { "_暂无正文。_".to_string() } else { body }
+        );
+        write_md_file(&file, &content)?;
+        export_binder_nodes(project_path, &node.children, output_dir, &current_trail, index)?;
+    }
+
+    Ok(())
+}
+
+fn write_empty_notice(output_dir: &Path, label: &str) -> Result<(), String> {
+    fs::create_dir_all(output_dir).map_err(|e| format!("无法创建导出目录 {}：{}", output_dir.display(), e))?;
+    let file = output_dir.join("README.md");
+    write_md_file(&file, &format!("# {}\n\n暂无内容。\n", label))
+}
+
+fn export_resource_kind(resources: &[ResourceRecord], kind: &str, label: &str, output_dir: &Path) -> Result<usize, String> {
+    let items: Vec<&ResourceRecord> = resources.iter().filter(|resource| resource.kind == kind).collect();
+    fs::create_dir_all(output_dir).map_err(|e| format!("无法创建导出目录 {}：{}", output_dir.display(), e))?;
+
+    if items.is_empty() {
+        write_empty_notice(output_dir, label)?;
+        return Ok(0);
+    }
+
+    for (position, item) in items.iter().enumerate() {
+        let file = output_dir.join(markdown_filename(position + 1, &item.title, &item.id));
+        let tags = if item.tags.is_empty() { "无".to_string() } else { item.tags.join("、") };
+        let subtitle = if item.subtitle.trim().is_empty() { "无" } else { item.subtitle.trim() };
+        let group = if item.group.trim().is_empty() { "默认" } else { item.group.trim() };
+        let status = if item.status.trim().is_empty() { "未设置" } else { item.status.trim() };
+        let body = if item.body.trim().is_empty() { "_暂无正文。_".to_string() } else { item.body.trim().to_string() };
+        let content = format!(
+            "# {}\n\n- 类型：{}\n- 副标题：{}\n- 分组：{}\n- 状态：{}\n- 标签：{}\n- 创建时间：{}\n- 更新时间：{}\n\n{}\n",
+            item.title.trim(),
+            label,
+            subtitle,
+            group,
+            status,
+            tags,
+            item.created_at,
+            item.updated_at,
+            body
+        );
+        write_md_file(&file, &content)?;
+    }
+
+    Ok(items.len())
+}
+
+
+fn export_structure_data(
+    chapters: &[StructureChapterRecord],
+    scenes: &[OutlineSceneRecord],
+    output_dir: &Path,
+) -> Result<(usize, usize), String> {
+    fs::create_dir_all(output_dir).map_err(|e| format!("无法创建导出目录 {}：{}", output_dir.display(), e))?;
+    if chapters.is_empty() && scenes.is_empty() {
+        write_empty_notice(output_dir, "结构")?;
+        return Ok((0, 0));
+    }
+
+    let mut ordered_chapters = chapters.to_vec();
+    ordered_chapters.sort_by(|a, b| {
+        let left = (a.parent_id.clone(), a.order, a.title.clone());
+        let right = (b.parent_id.clone(), b.order, b.title.clone());
+        left.cmp(&right)
+    });
+
+    let mut tree = String::from("# 结构章节树
+
+");
+    let roots: Vec<&StructureChapterRecord> = ordered_chapters.iter().filter(|chapter| chapter.parent_id.trim().is_empty()).collect();
+    fn write_chapter_branch(
+        output: &mut String,
+        chapters: &[StructureChapterRecord],
+        scenes: &[OutlineSceneRecord],
+        parent: &StructureChapterRecord,
+        depth: usize,
+    ) {
+        let indent = "  ".repeat(depth);
+        let scene_count = scenes.iter().filter(|scene| scene.chapter_id.as_deref() == Some(parent.id.as_str())).count();
+        output.push_str(&format!("{}- {}（{} 场，目标 {} 字）
+", indent, parent.title, scene_count, parent.target_words));
+        if !parent.notes.trim().is_empty() {
+            output.push_str(&format!("{}  - 备注：{}
+", indent, parent.notes.trim()));
+        }
+        let mut children: Vec<&StructureChapterRecord> = chapters.iter().filter(|chapter| chapter.parent_id == parent.id).collect();
+        children.sort_by_key(|chapter| (chapter.order, chapter.title.clone()));
+        for child in children {
+            write_chapter_branch(output, chapters, scenes, child, depth + 1);
+        }
+    }
+    for root in roots {
+        write_chapter_branch(&mut tree, &ordered_chapters, scenes, root, 0);
+    }
+    if ordered_chapters.iter().all(|chapter| !chapter.parent_id.trim().is_empty()) {
+        for chapter in &ordered_chapters {
+            tree.push_str(&format!("- {}（目标 {} 字）
+", chapter.title, chapter.target_words));
+        }
+    }
+    write_md_file(&output_dir.join("章节树.md"), &tree)?;
+
+    let scene_dir = output_dir.join("场景");
+    fs::create_dir_all(&scene_dir).map_err(|e| format!("无法创建导出目录 {}：{}", scene_dir.display(), e))?;
+    if scenes.is_empty() {
+        write_empty_notice(&scene_dir, "场景")?;
+    } else {
+        let chapter_title = |scene: &OutlineSceneRecord| -> String {
+            scene.chapter_id.as_ref()
+                .and_then(|id| chapters.iter().find(|chapter| &chapter.id == id))
+                .map(|chapter| chapter.title.clone())
+                .or_else(|| if scene.chapter.trim().is_empty() { None } else { Some(scene.chapter.clone()) })
+                .unwrap_or_else(|| "未指定".to_string())
+        };
+        for (position, scene) in scenes.iter().enumerate() {
+            let file = scene_dir.join(markdown_filename(position + 1, &scene.title, &scene.id));
+            let characters = if scene.characters.is_empty() { "无".to_string() } else { scene.characters.join("、") };
+            let items = if scene.items.is_empty() { "无".to_string() } else { scene.items.join("、") };
+            let tags = if scene.tags.is_empty() { "无".to_string() } else { scene.tags.join("、") };
+            let content = format!(
+                "# {}
+
+- 所属章节：{}
+- 场景序号：{}
+- 状态：{}
+- 字数：{} / {}
+- POV：{}
+- 地点：{}
+- 时间点：{}
+- 人物：{}
+- 物品 / 线索：{}
+- 标签：{}
+- 创建时间：{}
+- 更新时间：{}
+
+## 内容
+
+{}
+
+## 描述
+
+{}
+
+## 目标
+
+{}
+
+## 冲突
+
+{}
+
+## 结果
+
+{}
+
+## 备注
+
+{}
+",
+                scene.title.trim(),
+                chapter_title(scene),
+                if scene.scene_no.trim().is_empty() { "未设置" } else { scene.scene_no.trim() },
+                scene.status.trim(),
+                scene.current_words,
+                scene.target_words,
+                if scene.pov.trim().is_empty() { "未设置" } else { scene.pov.trim() },
+                if scene.location.trim().is_empty() { "未设置" } else { scene.location.trim() },
+                if scene.timeline.trim().is_empty() { "未设置" } else { scene.timeline.trim() },
+                characters,
+                items,
+                tags,
+                scene.created_at,
+                scene.updated_at,
+                if scene.summary.trim().is_empty() { "_暂无内容。_" } else { scene.summary.trim() },
+                if scene.notes.trim().is_empty() { "_暂无描述。_" } else { scene.notes.trim() },
+                if scene.goal.trim().is_empty() { "_暂无目标。_" } else { scene.goal.trim() },
+                if scene.conflict.trim().is_empty() { "_暂无冲突。_" } else { scene.conflict.trim() },
+                if scene.outcome.trim().is_empty() { "_暂无结果。_" } else { scene.outcome.trim() },
+                if scene.notes.trim().is_empty() { "_暂无备注。_" } else { scene.notes.trim() },
+            );
+            write_md_file(&file, &content)?;
+        }
+    }
+
+    Ok((chapters.len(), scenes.len()))
+}
+
+fn add_path_to_zip<W: Write + Seek>(
+    zip: &mut ZipWriter<W>,
+    base_dir: &Path,
+    current_path: &Path,
+) -> Result<(), String> {
+    let relative_name = current_path
+        .strip_prefix(base_dir)
+        .map_err(|e| format!("无法计算压缩包相对路径：{}", e))?
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    if current_path.is_dir() {
+        if !relative_name.is_empty() {
+            let directory_name = if relative_name.ends_with('/') {
+                relative_name.clone()
+            } else {
+                format!("{}/", relative_name)
+            };
+            let directory_options = FileOptions::default()
+                .compression_method(CompressionMethod::Stored)
+                .unix_permissions(0o755);
+            zip.add_directory(directory_name, directory_options)
+                .map_err(|e| format!("无法写入压缩包目录：{}", e))?;
+        }
+
+        let mut entries = fs::read_dir(current_path)
+            .map_err(|e| format!("无法读取导出目录 {}：{}", current_path.display(), e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("无法读取导出目录项：{}", e))?;
+        entries.sort_by_key(|entry| entry.path());
+
+        for entry in entries {
+            add_path_to_zip(zip, base_dir, &entry.path())?;
+        }
+        return Ok(());
+    }
+
+    if current_path.is_file() {
+        let file_options = FileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .unix_permissions(0o644);
+        zip.start_file(relative_name, file_options)
+            .map_err(|e| format!("无法写入压缩包文件头：{}", e))?;
+        let mut input = File::open(current_path)
+            .map_err(|e| format!("无法读取待压缩文件 {}：{}", current_path.display(), e))?;
+        io::copy(&mut input, zip)
+            .map_err(|e| format!("无法写入压缩包内容：{}", e))?;
+    }
+
+    Ok(())
+}
+
+fn create_zip_archive(source_dir: &Path, zip_path: &Path) -> Result<(), String> {
+    if zip_path.exists() {
+        fs::remove_file(zip_path).map_err(|e| format!("无法覆盖已有压缩包 {}：{}", zip_path.display(), e))?;
+    }
+
+    let parent = source_dir.parent().ok_or_else(|| "导出目录缺少父目录。".to_string())?;
+    let output = File::create(zip_path).map_err(|e| format!("无法创建压缩包 {}：{}", zip_path.display(), e))?;
+    let mut zip = ZipWriter::new(output);
+    add_path_to_zip(&mut zip, parent, source_dir)?;
+    zip.finish().map_err(|e| format!("压缩包写入失败：{}", e))?;
+
+    if !zip_path.exists() {
+        return Err("压缩包创建失败：目标文件不存在。".to_string());
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn export_project_markdown_zip(
+    path: String,
+    resources: Vec<ResourceRecord>,
+    structure_chapters: Vec<StructureChapterRecord>,
+    outline_scenes: Vec<OutlineSceneRecord>,
+) -> Result<String, String> {
+    ensure_project_dirs(&path)?;
+    let manifest = read_manifest_from(&path)?;
+    let binder = read_binder_state(&path)?;
+    let desktop = desktop_dir()?;
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let safe_project_name = {
+        let clean = clean_component(&manifest.name);
+        if clean.trim().is_empty() { "MasterPieces项目".to_string() } else { clean }
+    };
+    let export_name = format!("{}-Markdown导出-{}", safe_project_name, timestamp);
+    let export_dir = desktop.join(&export_name);
+    let zip_path = desktop.join(format!("{}.zip", export_name));
+
+    fs::create_dir_all(&export_dir).map_err(|e| format!("无法创建导出目录 {}：{}", export_dir.display(), e))?;
+
+    let mut draft_count = 0;
+    let draft_dir = export_dir.join("项目文件");
+    export_binder_nodes(&path, &binder.draft.children, &draft_dir, &[binder.draft.title.clone()], &mut draft_count)?;
+    if draft_count == 0 {
+        write_empty_notice(&draft_dir, "项目文件")?;
+    }
+
+    let mut outline_count = 0;
+    let outline_dir = export_dir.join("大纲");
+    export_binder_nodes(&path, &binder.outline.children, &outline_dir, &[binder.outline.title.clone()], &mut outline_count)?;
+    if outline_count == 0 {
+        write_empty_notice(&outline_dir, "大纲")?;
+    }
+
+    let characters_count = export_resource_kind(&resources, "characters", "人物", &export_dir.join("人物"))?;
+    let lore_count = export_resource_kind(&resources, "lore", "设定", &export_dir.join("设定"))?;
+    let timeline_count = export_resource_kind(&resources, "timeline", "时间线", &export_dir.join("时间线"))?;
+    let ideas_count = export_resource_kind(&resources, "ideas", "灵感", &export_dir.join("灵感"))?;
+    let (structure_chapter_count, structure_scene_count) = export_structure_data(&structure_chapters, &outline_scenes, &export_dir.join("结构"))?;
+
+    let readme = format!(
+        "# {}\n\n- 项目 ID：{}\n- 项目路径：{}\n- 创建时间：{}\n- 更新时间：{}\n- 导出时间：{}\n\n## 导出内容\n\n- 项目文件：{} 个 Markdown 文件\n- 大纲：{} 个 Markdown 文件\n- 人物：{} 张资料卡\n- 设定：{} 张资料卡\n- 时间线：{} 条记录\n- 灵感：{} 条记录\n- 结构章节：{} 个\n- 结构场景：{} 个\n\n> 本压缩包由 MasterPieces 导出。富文本样式会尽量转换为 Markdown 文本。\n",
+        manifest.name,
+        manifest.id,
+        path,
+        manifest.created_at,
+        manifest.updated_at,
+        Utc::now().to_rfc3339(),
+        draft_count,
+        outline_count,
+        characters_count,
+        lore_count,
+        timeline_count,
+        ideas_count,
+        structure_chapter_count,
+        structure_scene_count
+    );
+    write_md_file(&export_dir.join("README.md"), &readme)?;
+
+    create_zip_archive(&export_dir, &zip_path)?;
+    let _ = fs::remove_dir_all(&export_dir);
+
+    Ok(zip_path.to_string_lossy().to_string())
+}
+
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let url = if cfg!(debug_assertions) {
                 tauri::WebviewUrl::External("http://localhost:1420/".parse().unwrap())
@@ -762,9 +1547,15 @@ fn main() {
             update_binder_root,
             create_binder_document,
             rename_binder_document,
+            move_binder_document_to_trash,
+            restore_binder_document_from_trash,
+            purge_binder_trash_item,
+            purge_binder_trash_items,
             delete_binder_document,
             read_binder_document,
-            save_binder_document
+            save_binder_document,
+            list_system_fonts,
+            export_project_markdown_zip
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
